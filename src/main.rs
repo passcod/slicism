@@ -1,9 +1,13 @@
-use async_std::{fs, io::BufReader, task, prelude::*};
+use async_std::{fs, io::BufReader, prelude::*, task};
 use dashmap::DashMap;
+use indexmap::IndexMap;
+use num_derive::{FromPrimitive, ToPrimitive};
 use regex::Regex;
 use serde_derive::Deserialize;
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
+    alloc::Layout,
+    collections::{hash_map::DefaultHasher, HashMap},
+    convert::TryInto,
     ffi::OsStr,
     fmt,
     hash::Hasher,
@@ -13,14 +17,16 @@ use std::{
     time::SystemTime,
 };
 use tide::{Request, Response};
-use wasmer_runtime::Instance;
+use wasmer_runtime::{func, imports, instantiate as instantiate_wasm, Func, Instance};
 
 const fn default_version() -> usize {
     1
 }
+
 fn default_bind() -> SocketAddr {
     "127.0.0.1:8080".parse().unwrap()
 }
+
 fn default_path() -> PathBuf {
     ".".into()
 }
@@ -58,13 +64,10 @@ pub struct Mapping {
     pub src: Regex,
     pub dst: PathBuf,
     #[serde(default)]
-    pub post: HashMap<String, String>,
+    pub post: IndexMap<String, String>,
     #[serde(default)]
-    pub headers: HashMap<String, String>,
+    pub headers: IndexMap<String, String>,
 }
-
-//^ todo: preserve post/headers order
-// todo: cow strings (and paths?)
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Capabilities {
@@ -86,16 +89,78 @@ pub struct LoadedSlice {
     pub use_counter: Arc<AtomicUsize>,
 }
 
+type PtrLen = (u64, u64);
+
+#[derive(FromPrimitive, ToPrimitive)]
+#[repr(u8)]
+enum WasmRet {
+    Success = 0,
+    GenericError = 1,
+    NotImplemented = 51,
+    UnknownError = 255,
+}
+
+impl WasmRet {
+    pub fn from_wasm(i: u8) -> Self {
+        use num_traits::FromPrimitive;
+        Self::from_u8(i).unwrap_or(Self::UnknownError)
+    }
+}
+
+fn request_uri() -> PtrLen {
+    (0, 0)
+}
+
+fn response_status(status: u32) -> u8 {
+    use num_traits::ToPrimitive;
+    WasmRet::NotImplemented.to_u8().unwrap()
+}
+
 impl LoadedSlice {
     pub fn new(source: &[u8], hash: u64) -> Result<Self> {
-        let imports = wasmer_runtime::ImportObject::new();
-        let instance = wasmer_runtime::instantiate(source, &imports)?;
+        let imports = imports! {
+            "env" => {
+                "request_uri" => func!(request_uri),
+                "response_status" => func!(response_status),
+            },
+        };
+
+        let instance = instantiate_wasm(source, &imports)?;
+        instance.resolve_func("alloc")?;
+        instance.resolve_func("dealloc")?;
+        instance.resolve_func("main")?;
+
         Ok(Self {
             source_hash: hash,
             instance: Arc::new(Mutex::new(instance)),
             created: SystemTime::now(),
             use_counter: Default::default(),
         })
+    }
+
+    fn alloc(&self, layout: Layout) -> Result<*mut u8> {
+        let i = self.instance.lock().unwrap();
+        let inner: Func<(u64, u64), u64> = i.func("alloc")?;
+        let ptr = inner.call(layout.size().try_into()?, layout.align().try_into()?)?;
+        Ok(ptr as *mut u8)
+    }
+
+    fn dealloc(&self, ptr: *mut u8, layout: Layout) -> Result<()> {
+        let i = self.instance.lock().unwrap();
+        let inner: Func<(u64, u64, u64)> = i.func("dealloc")?;
+        inner.call(
+            ptr as u64,
+            layout.size().try_into()?,
+            layout.align().try_into()?,
+        )?;
+        Ok(())
+    }
+
+    fn main(&self) -> Result<WasmRet> {
+        let i = self.instance.lock().unwrap();
+        let inner: Func<(), u8> = i.func("main")?;
+        let ret = inner.call()?;
+        Ok(WasmRet::from_wasm(ret))
     }
 }
 
@@ -133,8 +198,12 @@ impl Slices {
             let hash = r.value();
             if let Some(r) = self.from_hash.get(&hash) {
                 match r.value() {
-                    Slice::InvalidWasm { seen } if modtime <= *seen => return Err(ErrorKind::InvalidWasm.into()),
-                    Slice::Loaded(LoadedSlice { created, .. }) if modtime < *created => return Ok(()), // already loaded
+                    Slice::InvalidWasm { seen } if modtime <= *seen => {
+                        return Err(ErrorKind::InvalidWasm.into())
+                    }
+                    Slice::Loaded(LoadedSlice { created, .. }) if modtime < *created => {
+                        return Ok(())
+                    } // already loaded
                     _ => {
                         // needs a re-hash
                     }
@@ -176,8 +245,18 @@ impl Slices {
                 Ok(())
             }
             Err(err) => {
-                log::error!("error loading wasm file={} hash={}: {}", path.display(), hash, err);
-                self.from_hash.insert(hash, Slice::InvalidWasm { seen: SystemTime::now() });
+                log::error!(
+                    "error loading wasm file={} hash={}: {}",
+                    path.display(),
+                    hash,
+                    err
+                );
+                self.from_hash.insert(
+                    hash,
+                    Slice::InvalidWasm {
+                        seen: SystemTime::now(),
+                    },
+                );
                 self.from_path.insert(path, hash);
                 Err(ErrorKind::InvalidWasm.into())
             }
@@ -187,10 +266,13 @@ impl Slices {
 
 error_chain::error_chain! {
     foreign_links {
+        IntConversion(::std::num::TryFromIntError);
         Io(::std::io::Error);
-        Toml(::toml::de::Error);
-        Wasmer(::wasmer_runtime::error::Error);
         Log(::log::SetLoggerError);
+        Toml(::toml::de::Error);
+        WasmInstantiation(::wasmer_runtime::error::Error);
+        WasmExportMissing(::wasmer_runtime_core::error::ResolveError);
+        WasmCall(::wasmer_runtime_core::error::RuntimeError);
     }
 
     errors {
