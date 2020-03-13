@@ -6,18 +6,30 @@ use regex::Regex;
 use serde_derive::Deserialize;
 use std::{
     alloc::Layout,
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::hash_map::DefaultHasher,
     convert::TryInto,
     ffi::OsStr,
     fmt,
     hash::Hasher,
     net::SocketAddr,
     path::PathBuf,
-    sync::{atomic::AtomicUsize, Arc, Mutex},
+    ptr::NonNull,
+    sync::{
+        atomic::{AtomicU8, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::SystemTime,
 };
 use tide::{Request, Response};
-use wasmer_runtime::{func, imports, instantiate as instantiate_wasm, Func, Instance};
+use wasmer_runtime::{
+    compile as compile_wasm, func, imports,
+    types::{TableIndex, Value as WasmValue},
+    Ctx, Func, Instance, Module,
+};
+use wasmer_runtime_core::module::ExportIndex;
+
+#[cfg(not(any(target_pointer_width = "32", target_pointer_width = "64")))]
+compile_error!("only 32 and 64 bit pointers are supported");
 
 const fn default_version() -> usize {
     1
@@ -81,29 +93,30 @@ pub struct CapNet {
     pub only: Vec<PathBuf>,
 }
 
-#[derive(Clone)]
-pub struct LoadedSlice {
-    pub source_hash: u64,
-    pub instance: Arc<Mutex<Instance>>,
-    pub created: SystemTime,
-    pub use_counter: Arc<AtomicUsize>,
-}
-
 type PtrLen = (u64, u64);
 
-#[derive(FromPrimitive, ToPrimitive)]
+#[derive(Debug, Clone, Copy, FromPrimitive, ToPrimitive, PartialEq, Eq)]
 #[repr(u8)]
-enum WasmRet {
-    Success = 0,
-    GenericError = 1,
+pub enum WasmError {
+    None = 0,
+    Generic = 1,
+    Alloc = 2,
     NotImplemented = 51,
-    UnknownError = 255,
+
+    InvalidResponse = 100,
+    StatusOutOfBounds = 101,
+
+    Unknown = 255,
 }
 
-impl WasmRet {
+impl WasmError {
     pub fn from_wasm(i: u8) -> Self {
         use num_traits::FromPrimitive;
-        Self::from_u8(i).unwrap_or(Self::UnknownError)
+        Self::from_u8(i).unwrap_or(Self::Unknown)
+    }
+
+    pub fn code(self) -> u8 {
+        self as u8
     }
 }
 
@@ -112,66 +125,232 @@ fn request_uri() -> PtrLen {
 }
 
 fn response_status(status: u32) -> u8 {
-    use num_traits::ToPrimitive;
-    WasmRet::NotImplemented.to_u8().unwrap()
+    WasmError::NotImplemented.code()
 }
 
-impl LoadedSlice {
-    pub fn new(source: &[u8], hash: u64) -> Result<Self> {
-        let imports = imports! {
-            "env" => {
-                "request_uri" => func!(request_uri),
-                "response_status" => func!(response_status),
-            },
-        };
+pub struct WasmAllocation {
+    pub memory: u32,
+    pub offset: usize,
+    pub length: usize,
+}
 
-        let instance = instantiate_wasm(source, &imports)?;
-        instance.resolve_func("alloc")?;
-        instance.resolve_func("dealloc")?;
-        instance.resolve_func("main")?;
+/// Allocate memory inside wasm
+///
+/// # Errors
+///
+///  - [`WasmError`](ErrorKind::WasmError)` containing [`WasmError::Alloc`], specifies that the
+///    allocation itself inside wasm failed. This may be recoverable (e.g. by growing the
+///    instance memory).
+///
+///  - [`WasmCall`](ErrorKind::WasmCall) is the call to the wasm instance failing. This is not
+///    recoverable and the instance should be considered crashed.
+///
+///  - [`WasmTypeMismatch`](ErrorKind::WasmTypeMismatch) means the wasm allocator returned the
+///    wrong type. This is not recoverable and the _module_ should be considered invalid.
+///
+fn wasm_alloc(ctx: &mut Ctx, index: TableIndex, layout: Layout) -> Result<WasmAllocation> {
+    let size: u32 = layout.size().try_into()?;
+    let align: u32 = layout.align().try_into()?;
 
-        Ok(Self {
-            source_hash: hash,
-            instance: Arc::new(Mutex::new(instance)),
-            created: SystemTime::now(),
-            use_counter: Default::default(),
-        })
-    }
+    let res = ctx.call_with_table_index(
+        index,
+        &[WasmValue::I32(size as _), WasmValue::I32(align as _)],
+    )?;
 
-    fn alloc(&self, layout: Layout) -> Result<*mut u8> {
-        let i = self.instance.lock().unwrap();
-        let inner: Func<(u64, u64), u64> = i.func("alloc")?;
-        let ptr = inner.call(layout.size().try_into()?, layout.align().try_into()?)?;
-        Ok(ptr as *mut u8)
-    }
+    let (memory, offset, length) = match res.as_slice() {
+        [WasmValue::I32(mv), WasmValue::I32(ov), WasmValue::I32(sv)] => {
+            (*mv as u32, *ov as u32 as _, *sv as u32 as _)
+        }
+        _ => return Err(ErrorKind::WasmTypeMismatch("u32").into()),
+    };
 
-    fn dealloc(&self, ptr: *mut u8, layout: Layout) -> Result<()> {
-        let i = self.instance.lock().unwrap();
-        let inner: Func<(u64, u64, u64)> = i.func("dealloc")?;
-        inner.call(
-            ptr as u64,
-            layout.size().try_into()?,
-            layout.align().try_into()?,
-        )?;
-        Ok(())
-    }
+    Ok(WasmAllocation {
+        memory,
+        offset,
+        length,
+    })
+}
 
-    fn main(&self) -> Result<WasmRet> {
-        let i = self.instance.lock().unwrap();
-        let inner: Func<(), u8> = i.func("main")?;
-        let ret = inner.call()?;
-        Ok(WasmRet::from_wasm(ret))
-    }
+/// De-allocate memory inside wasm
+///
+/// # Errors
+///
+///  - [`WasmCall`](ErrorKind::WasmCall) is the call to the wasm instance failing. This is not
+///    recoverable and the instance should be considered crashed.
+///
+fn wasm_dealloc(ctx: &mut Ctx, index: TableIndex, memory: u32, layout: Layout) -> Result<()> {
+    let memory = WasmValue::I32(memory as _);
+    let size = WasmValue::I32(layout.size() as _);
+    let align = WasmValue::I32(layout.align() as _);
+
+    ctx.call_with_table_index(index, &[memory, size, align])?;
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct LoadedSlice {
+    source_hash: u64,
+    created: SystemTime,
+    counter: Arc<AtomicUsize>,
+    module: Module,
+    alloc_index: TableIndex,
+    dealloc_index: TableIndex,
 }
 
 impl fmt::Debug for LoadedSlice {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("LoadedSlice")
             .field("source_hash", &self.source_hash)
-            .field("instance", &"<wasmer instance>")
             .field("created", &self.created)
-            .field("use_counter", &self.use_counter)
+            .field("counter", &self.counter)
+            .field("module", &"<compiled wasmer module>")
+            .field("alloc_index", &unsafe {
+                std::mem::transmute::<_, u32>(self.alloc_index)
+            })
+            .field("dealloc_index", &unsafe {
+                std::mem::transmute::<_, u32>(self.dealloc_index)
+            })
             .finish()
+    }
+}
+
+impl LoadedSlice {
+    pub fn new(source: &[u8], hash: u64) -> Result<Self> {
+        let module = compile_wasm(source)?;
+        let alloc_index = Self::func_index(&module, "alloc")?;
+        let dealloc_index = Self::func_index(&module, "dealloc")?;
+
+        Ok(Self {
+            source_hash: hash,
+            module,
+            created: SystemTime::now(),
+            counter: Default::default(),
+            alloc_index,
+            dealloc_index,
+        })
+    }
+
+    fn func_index(module: &Module, name: &'static str) -> Result<TableIndex> {
+        let export_index = module
+            .info()
+            .exports
+            .get(name)
+            .ok_or_else(|| ErrorKind::WasmExportMissing(name))?;
+        if let ExportIndex::Func(func_index) = export_index {
+            Ok(unsafe { std::mem::transmute(*func_index) })
+        } else {
+            Err(ErrorKind::WasmExportMissing(name).into())
+        }
+    }
+
+    pub fn source_hash(&self) -> u64 {
+        self.source_hash
+    }
+
+    pub fn created(&self) -> &SystemTime {
+        &self.created
+    }
+
+    pub fn counter(&self) -> usize {
+        self.counter.load(Ordering::Relaxed)
+    }
+
+    pub fn bite<S: Send + Sync>(&self, req: &Request<S>) -> Result<Response> {
+        let req = Arc::new(FlatRequest::from(req));
+        let res = Arc::new(Mutex::new(FlatResponse::new()));
+        let exit = Arc::new(AtomicU8::new(0));
+
+        let imports = imports! {
+            "env" => {
+                "exit_get" => {
+                    let exit = exit.clone();
+                    func!(move || -> u8 {
+                        exit.load(Ordering::Acquire)
+                    })
+                },
+                "exit_set" => {
+                    let exit = exit.clone();
+                    func!(move |s: u8| {
+                        exit.store(s, Ordering::Release)
+                    })
+                },
+                "request_uri" => {
+                    let req = req.clone();
+                    func!(move |ctx: &mut Ctx| -> PtrLen {
+                        let uri = &req.uri;
+                        (0, 0)
+                    })
+                },
+                "response_status" => {
+                    let res = res.clone();
+                    func!(move |status: u16| -> u8 {
+                        match tide::http::StatusCode::from_u16(status) {
+                            Ok(_) => {
+                                let mut res = res.lock().unwrap();
+                                res.status = status;
+                                WasmError::None
+                            }
+                            Err(_) => {
+                                WasmError::StatusOutOfBounds
+                            }
+                        }.code()
+                    })
+                },
+            },
+        };
+
+        self.counter.fetch_add(1, Ordering::Relaxed);
+
+        // Instantiate and immediately drop. Why? Because instantiate runs the module's start
+        // function (equiv to main()). That runs everything the module should do, and has access to
+        // the imports above, plus we do ctx-wrangling to get to the alloc and dealloc exports.
+        // Thus, once the instantiate call is done, the module has fulfilled its purpose, and we
+        // trash it.
+        //
+        // This is what ensures isolation: each call to a module is a brand new instance, with no
+        // shared state. We only compile once, though.
+        //
+        // The reason this is in braces here rather than relying on implicit drop at the end of fn
+        // scope is to guarantee the instance has dropped before we unwrap the Arc<Mutex> of the
+        // Response and load the exit code.
+        {
+            self.module.instantiate(&imports)?;
+        }
+
+        match WasmError::from_wasm(exit.load(Ordering::SeqCst)) {
+            WasmError::None => Ok(res.lock().unwrap().clone().into()),
+            error => Err(ErrorKind::WasmError(error).into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FlatRequest {
+    pub uri: String,
+}
+
+impl<S> From<&Request<S>> for FlatRequest {
+    fn from(req: &Request<S>) -> Self {
+        Self {
+            uri: req.uri().to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FlatResponse {
+    pub status: u16,
+}
+
+impl FlatResponse {
+    fn new() -> Self {
+        Self { status: 501 }
+    }
+}
+
+impl From<FlatResponse> for Response {
+    fn from(res: FlatResponse) -> Self {
+        Self::new(res.status)
     }
 }
 
@@ -188,6 +367,13 @@ pub struct Slices {
 }
 
 impl Slices {
+    pub fn get_loaded(&self, path: PathBuf) -> Option<Slice> {
+        self.from_path
+            .get(&path)
+            .and_then(|hash| self.from_hash.get(hash.value()))
+            .map(|slice| slice.value().clone())
+    }
+
     pub async fn load(&self, path: PathBuf, mut file: fs::File) -> Result<()> {
         // todo: debug logging throughout here
 
@@ -199,7 +385,7 @@ impl Slices {
             if let Some(r) = self.from_hash.get(&hash) {
                 match r.value() {
                     Slice::InvalidWasm { seen } if modtime <= *seen => {
-                        return Err(ErrorKind::InvalidWasm.into())
+                        return Err(ErrorKind::WasmInvalid.into())
                     }
                     Slice::Loaded(LoadedSlice { created, .. }) if modtime < *created => {
                         return Ok(())
@@ -228,7 +414,7 @@ impl Slices {
                 Slice::InvalidWasm { .. } => {
                     // we already know it's bad, so bail
                     self.from_path.insert(path, hash);
-                    return Err(ErrorKind::InvalidWasm.into());
+                    return Err(ErrorKind::WasmInvalid.into());
                 }
                 Slice::Loaded(_) => {
                     // we already know it's good, so bail
@@ -258,7 +444,7 @@ impl Slices {
                     },
                 );
                 self.from_path.insert(path, hash);
-                Err(ErrorKind::InvalidWasm.into())
+                Err(ErrorKind::WasmInvalid.into())
             }
         }
     }
@@ -270,14 +456,33 @@ error_chain::error_chain! {
         Io(::std::io::Error);
         Log(::log::SetLoggerError);
         Toml(::toml::de::Error);
+        WasmCompilation(::wasmer_runtime_core::error::CompileError);
         WasmInstantiation(::wasmer_runtime::error::Error);
-        WasmExportMissing(::wasmer_runtime_core::error::ResolveError);
-        WasmCall(::wasmer_runtime_core::error::RuntimeError);
+        WasmCall(::wasmer_runtime_core::error::CallError);
     }
 
     errors {
-        InvalidWasm {
+        WasmInvalid {
             description("file is invalid wasm")
+        }
+
+        WasmNullPtr {
+            description("wasm returned a null pointer")
+        }
+
+        WasmTypeMismatch(expected: &'static str) {
+            description("unexpected type returned from wasm")
+            display("unexpected type returned from wasm, expected {}", expected)
+        }
+
+        WasmExportMissing(e: &'static str) {
+            description("wasm export missing")
+            display("missing wasm export: {}", e)
+        }
+
+        WasmError(e: WasmError) {
+            description("wasm internal error")
+            display("wasm internal error: {:?} ({})", e, e.code())
         }
     }
 }
@@ -296,8 +501,16 @@ async fn slicing(req: Request<S>) -> Result<Response> {
 
     if path.extension() == Some(OsStr::new("wasm")) {
         // wasm!
-        state.slices.load(path, file).await?;
-        Ok(Response::new(200).body_string("wasm loaded".into()))
+        state.slices.load(path.clone(), file).await?;
+        match state.slices.get_loaded(path) {
+            Some(Slice::Loaded(slice)) => {
+                let res = slice.bite(&req)?;
+                dbg!(&slice.counter);
+                Ok(res)
+            }
+            Some(Slice::InvalidWasm { .. }) => Ok(Response::new(500)),
+            None => Ok(Response::new(404)),
+        }
     } else if state.config.static_files {
         Ok(Response::with_reader(200, BufReader::new(file)))
     } else {
