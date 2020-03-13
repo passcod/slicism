@@ -6,16 +6,15 @@ use regex::Regex;
 use serde_derive::Deserialize;
 use std::{
     alloc::Layout,
-    collections::hash_map::DefaultHasher,
+    collections::{hash_map::DefaultHasher, BTreeMap},
     convert::TryInto,
     ffi::OsStr,
     fmt,
     hash::Hasher,
     net::SocketAddr,
     path::PathBuf,
-    ptr::NonNull,
     sync::{
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::SystemTime,
@@ -24,7 +23,7 @@ use tide::{Request, Response};
 use wasmer_runtime::{
     compile as compile_wasm, func, imports,
     types::{TableIndex, Value as WasmValue},
-    Ctx, Func, Instance, Module,
+    Ctx, Module,
 };
 use wasmer_runtime_core::module::ExportIndex;
 
@@ -58,15 +57,41 @@ pub struct Slicefile {
     #[serde(default)]
     pub preload: bool,
     #[serde(default)]
-    pub map: Vec<Mapping>,
+    pub gc: GcOpts,
     #[serde(default)]
-    pub cap: Capabilities,
+    pub map: Vec<Mapping>,
 }
 
 impl Slicefile {
     pub async fn normalise(&mut self) -> Result<()> {
         self.root = fs::canonicalize(&self.root).await?.into();
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct GcOpts {
+    #[serde(default = "GcOpts::default_interval")]
+    pub interval: usize,
+    #[serde(default = "GcOpts::default_invalids")]
+    pub keep_invalids: usize,
+}
+
+impl GcOpts {
+    const fn default_interval() -> usize {
+        300
+    }
+    const fn default_invalids() -> usize {
+        100
+    }
+}
+
+impl Default for GcOpts {
+    fn default() -> Self {
+        Self {
+            interval: Self::default_interval(),
+            keep_invalids: Self::default_invalids(),
+        }
     }
 }
 
@@ -81,19 +106,7 @@ pub struct Mapping {
     pub headers: IndexMap<String, String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct Capabilities {
-    pub net: Option<CapNet>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct CapNet {
-    pub enabled: bool,
-    #[serde(default)]
-    pub only: Vec<PathBuf>,
-}
-
-type PtrLen = (u64, u64);
+type PtrLen = (u32, u32);
 
 #[derive(Debug, Clone, Copy, FromPrimitive, ToPrimitive, PartialEq, Eq)]
 #[repr(u8)]
@@ -118,14 +131,6 @@ impl WasmError {
     pub fn code(self) -> u8 {
         self as u8
     }
-}
-
-fn request_uri() -> PtrLen {
-    (0, 0)
-}
-
-fn response_status(status: u32) -> u8 {
-    WasmError::NotImplemented.code()
 }
 
 pub struct WasmAllocation {
@@ -192,6 +197,7 @@ pub struct LoadedSlice {
     source_hash: u64,
     created: SystemTime,
     counter: Arc<AtomicUsize>,
+    decay: Arc<AtomicBool>,
     module: Module,
     alloc_index: TableIndex,
     dealloc_index: TableIndex,
@@ -203,6 +209,7 @@ impl fmt::Debug for LoadedSlice {
             .field("source_hash", &self.source_hash)
             .field("created", &self.created)
             .field("counter", &self.counter)
+            .field("decay", &self.decay)
             .field("module", &"<compiled wasmer module>")
             .field("alloc_index", &unsafe {
                 std::mem::transmute::<_, u32>(self.alloc_index)
@@ -224,7 +231,8 @@ impl LoadedSlice {
             source_hash: hash,
             module,
             created: SystemTime::now(),
-            counter: Default::default(),
+            counter: Arc::new(AtomicUsize::new(0)),
+            decay: Arc::new(AtomicBool::new(false)),
             alloc_index,
             dealloc_index,
         })
@@ -530,6 +538,36 @@ impl State {
             config,
             slices: Slices::default(),
         })
+    }
+
+    // run every <config.gc.interval> default 1h
+    async fn gc(&self) {
+        let mut unload_list = Vec::new();
+        let mut invalids = BTreeMap::new();
+        for r in self.slices.from_hash.iter() {
+            match r.value() {
+                Slice::Loaded(slice) => {
+                    let decayed = slice.decay.swap(true, Ordering::AcqRel);
+                    if decayed {
+                        unload_list.push(*r.key());
+                    }
+                }
+                Slice::InvalidWasm { seen } => {
+                    invalids.insert(seen.clone(), *r.key());
+                }
+            }
+        }
+
+        if invalids.len() > self.config.gc.keep_invalids {
+            for (_, hash) in invalids.into_iter().skip(self.config.gc.keep_invalids) {
+                unload_list.push(hash);
+            }
+        }
+
+        for hash in unload_list.into_iter() {
+            // todo: take out of from_path
+            self.slices.from_hash.remove(&hash);
+        }
     }
 }
 
