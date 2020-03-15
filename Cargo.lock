@@ -1266,6 +1266,7 @@ dependencies = [
  "dashmap",
  "error-chain",
  "fern",
+ "futures 0.3.4",
  "indexmap",
  "log",
  "num-derive",

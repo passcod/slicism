@@ -1,5 +1,6 @@
 use async_std::{fs, io::BufReader, prelude::*, task};
 use dashmap::DashMap;
+use error_chain::{bail, error_chain};
 use indexmap::IndexMap;
 use num_derive::{FromPrimitive, ToPrimitive};
 use regex::Regex;
@@ -11,6 +12,7 @@ use std::{
     ffi::OsStr,
     fmt,
     hash::Hasher,
+    mem::align_of,
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -133,10 +135,47 @@ impl WasmError {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct WasmAllocation {
     pub memory: u32,
-    pub offset: usize,
-    pub length: usize,
+    pub offset: u32,
+    pub length: u32,
+}
+
+impl WasmAllocation {
+    pub fn as_wasm_ptr(&self) -> PtrLen {
+        (self.offset, self.length)
+    }
+
+    pub fn from_wasm(memory: u32, offset: u32, length: u32) -> Self {
+        Self {
+            memory,
+            offset,
+            length,
+        }
+    }
+
+    pub fn as_slice_range(&self) -> std::ops::Range<usize> {
+        (self.offset as _)..((self.offset + self.length) as _)
+    }
+
+    pub fn check_against_memory(&self, ctx: &mut Ctx) -> Result<()> {
+        let max = ctx.memory(self.memory).size().bytes().0;
+        let max = if max > std::u32::MAX as usize {
+            panic!("memory size of wasm is somehow > u32::MAX");
+        } else {
+            max as u32
+        };
+
+        if self.offset > max {
+            bail!(ErrorKind::WasmMemoryTooSmall(
+                max,
+                self.offset + self.length
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 /// Allocate memory inside wasm
@@ -164,9 +203,9 @@ fn wasm_alloc(ctx: &mut Ctx, index: TableIndex, layout: Layout) -> Result<WasmAl
 
     let (memory, offset, length) = match res.as_slice() {
         [WasmValue::I32(mv), WasmValue::I32(ov), WasmValue::I32(sv)] => {
-            (*mv as u32, *ov as u32 as _, *sv as u32 as _)
+            (*mv as u32, *ov as u32, *sv as u32)
         }
-        _ => return Err(ErrorKind::WasmTypeMismatch("u32").into()),
+        _ => bail!(ErrorKind::WasmTypeMismatch("u32")),
     };
 
     Ok(WasmAllocation {
@@ -183,6 +222,7 @@ fn wasm_alloc(ctx: &mut Ctx, index: TableIndex, layout: Layout) -> Result<WasmAl
 ///  - [`WasmCall`](ErrorKind::WasmCall) is the call to the wasm instance failing. This is not
 ///    recoverable and the instance should be considered crashed.
 ///
+#[allow(dead_code)] // not used, but keeping just in case
 fn wasm_dealloc(ctx: &mut Ctx, index: TableIndex, memory: u32, layout: Layout) -> Result<()> {
     let memory = WasmValue::I32(memory as _);
     let size = WasmValue::I32(layout.size() as _);
@@ -190,6 +230,45 @@ fn wasm_dealloc(ctx: &mut Ctx, index: TableIndex, memory: u32, layout: Layout) -
 
     ctx.call_with_table_index(index, &[memory, size, align])?;
     Ok(())
+}
+
+fn wasm_write(ctx: &mut Ctx, alloc: &WasmAllocation, bytes: &[u8]) -> Result<()> {
+    if bytes.len() > alloc.length as _ {
+        bail!(ErrorKind::WasmAllocTooSmall(alloc.length, bytes.len() as _));
+    }
+
+    alloc.check_against_memory(ctx)?;
+
+    let view = ctx.memory(alloc.memory).view::<u8>().atomically();
+    for (i, atom) in view[alloc.as_slice_range()].iter().enumerate() {
+        atom.store(bytes[i], Ordering::SeqCst);
+    }
+
+    Ok(())
+}
+
+fn wasm_alloc_and_write(
+    ctx: &mut Ctx,
+    alloc_index: TableIndex,
+    bytes: impl AsRef<[u8]>,
+) -> Result<WasmAllocation> {
+    let bytes = bytes.as_ref();
+    let layout = Layout::from_size_align(bytes.len(), align_of::<u8>())?;
+    let alloc = wasm_alloc(ctx, alloc_index, layout)?;
+    wasm_write(ctx, &alloc, bytes)?;
+    Ok(alloc)
+}
+
+fn wasm_read(ctx: &mut Ctx, alloc: &WasmAllocation) -> Result<Vec<u8>> {
+    alloc.check_against_memory(ctx)?;
+
+    let mut buf: Vec<u8> = Vec::with_capacity(alloc.length as _);
+    let view = ctx.memory(alloc.memory).view::<u8>().atomically();
+    for atom in view[alloc.as_slice_range()].iter() {
+        buf.push(atom.load(Ordering::SeqCst));
+    }
+
+    Ok(buf)
 }
 
 #[derive(Clone)]
@@ -247,7 +326,7 @@ impl LoadedSlice {
         if let ExportIndex::Func(func_index) = export_index {
             Ok(unsafe { std::mem::transmute(*func_index) })
         } else {
-            Err(ErrorKind::WasmExportMissing(name).into())
+            bail!(ErrorKind::WasmExportMissing(name))
         }
     }
 
@@ -270,6 +349,21 @@ impl LoadedSlice {
 
         let imports = imports! {
             "env" => {
+                "log" => func!(|ctx: &mut Ctx, level: u8, mem: u32, ptr: u32, len: u32| {
+                    use log::Level::*;
+                    let level = match level {
+                        0 => Error,
+                        1 => Warn,
+                        3 => Debug,
+                        4 => Trace,
+                        _ => Info,
+                    };
+
+                    let alloc = WasmAllocation::from_wasm(mem, ptr, len);
+                    let message = wasm_read(ctx, &alloc).unwrap();
+                    let message = String::from_utf8_lossy(&message);
+                    log::log!(level, "{}", message);
+                }),
                 "exit_get" => {
                     let exit = exit.clone();
                     func!(move || -> u8 {
@@ -282,11 +376,18 @@ impl LoadedSlice {
                         exit.store(s, Ordering::Release)
                     })
                 },
+                "request_method" => {
+                    let req = req.clone();
+                    let alloc_index = self.alloc_index;
+                    func!(move |ctx: &mut Ctx| -> PtrLen {
+                        wasm_alloc_and_write(ctx, alloc_index, &req.method).unwrap().as_wasm_ptr()
+                    })
+                },
                 "request_uri" => {
                     let req = req.clone();
+                    let alloc_index = self.alloc_index;
                     func!(move |ctx: &mut Ctx| -> PtrLen {
-                        let uri = &req.uri;
-                        (0, 0)
+                        wasm_alloc_and_write(ctx, alloc_index, &req.uri).unwrap().as_wasm_ptr()
                     })
                 },
                 "response_status" => {
@@ -304,6 +405,15 @@ impl LoadedSlice {
                         }.code()
                     })
                 },
+                "response_body" => {
+                    let res = res.clone();
+                    func!(move |ctx: &mut Ctx, mem: u32, ptr: u32, len: u32| {
+                        let alloc = WasmAllocation::from_wasm(mem, ptr, len);
+                        let body = wasm_read(ctx, &alloc).unwrap();
+                        let mut res = res.lock().unwrap();
+                        res.body = body;
+                    })
+                },
             },
         };
 
@@ -316,30 +426,28 @@ impl LoadedSlice {
         // trash it.
         //
         // This is what ensures isolation: each call to a module is a brand new instance, with no
-        // shared state. We only compile once, though.
-        //
-        // The reason this is in braces here rather than relying on implicit drop at the end of fn
-        // scope is to guarantee the instance has dropped before we unwrap the Arc<Mutex> of the
-        // Response and load the exit code.
+        // shared state beyond safe loads and stores via us. We only compile bytecode once, though.
         {
             self.module.instantiate(&imports)?;
         }
 
         match WasmError::from_wasm(exit.load(Ordering::SeqCst)) {
             WasmError::None => Ok(res.lock().unwrap().clone().into()),
-            error => Err(ErrorKind::WasmError(error).into()),
+            error => bail!(ErrorKind::WasmError(error)),
         }
     }
 }
 
 #[derive(Clone, Debug)]
 struct FlatRequest {
+    pub method: String,
     pub uri: String,
 }
 
 impl<S> From<&Request<S>> for FlatRequest {
     fn from(req: &Request<S>) -> Self {
         Self {
+            method: req.method().to_string(),
             uri: req.uri().to_string(),
         }
     }
@@ -348,17 +456,22 @@ impl<S> From<&Request<S>> for FlatRequest {
 #[derive(Clone, Debug)]
 struct FlatResponse {
     pub status: u16,
+    pub body: Vec<u8>,
 }
 
 impl FlatResponse {
     fn new() -> Self {
-        Self { status: 501 }
+        Self {
+            status: 501,
+            body: Vec::new(),
+        }
     }
 }
 
 impl From<FlatResponse> for Response {
     fn from(res: FlatResponse) -> Self {
-        Self::new(res.status)
+        let cursor = futures::io::Cursor::new(res.body);
+        Self::new(res.status).body(cursor)
     }
 }
 
@@ -393,7 +506,7 @@ impl Slices {
             if let Some(r) = self.from_hash.get(&hash) {
                 match r.value() {
                     Slice::InvalidWasm { seen } if modtime <= *seen => {
-                        return Err(ErrorKind::WasmInvalid.into())
+                        bail!(ErrorKind::WasmInvalid)
                     }
                     Slice::Loaded(LoadedSlice { created, .. }) if modtime < *created => {
                         return Ok(())
@@ -422,7 +535,7 @@ impl Slices {
                 Slice::InvalidWasm { .. } => {
                     // we already know it's bad, so bail
                     self.from_path.insert(path, hash);
-                    return Err(ErrorKind::WasmInvalid.into());
+                    bail!(ErrorKind::WasmInvalid);
                 }
                 Slice::Loaded(_) => {
                     // we already know it's good, so bail
@@ -452,16 +565,17 @@ impl Slices {
                     },
                 );
                 self.from_path.insert(path, hash);
-                Err(ErrorKind::WasmInvalid.into())
+                bail!(ErrorKind::WasmInvalid)
             }
         }
     }
 }
 
-error_chain::error_chain! {
+error_chain! {
     foreign_links {
         IntConversion(::std::num::TryFromIntError);
         Io(::std::io::Error);
+        Layout(::std::alloc::LayoutErr);
         Log(::log::SetLoggerError);
         Toml(::toml::de::Error);
         WasmCompilation(::wasmer_runtime_core::error::CompileError);
@@ -491,6 +605,16 @@ error_chain::error_chain! {
         WasmError(e: WasmError) {
             description("wasm internal error")
             display("wasm internal error: {:?} ({})", e, e.code())
+        }
+
+        WasmAllocTooSmall(alloc: u32, wanted: u32) {
+            description("wasm allocation is too small")
+            display("wasm allocation is {} bytes, wanted {} bytes", alloc, wanted)
+        }
+
+        WasmMemoryTooSmall(memory: u32, wanted: u32) {
+            description("wasm memory is too small")
+            display("wasm memory is {} bytes, wanted {} bytes", memory, wanted)
         }
     }
 }
