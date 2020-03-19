@@ -9,9 +9,3 @@ dst = "/net.wasm"
 src = "/capture/(.+)(?:/(.+))?"
 dst = "/echo.wasm"
 post = { hello = "$1", world = "$2" }
-
-[cap.net]
-enabled = true
-only = [
-	"/net.wasm"
-]
