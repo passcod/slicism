@@ -1,7 +1,9 @@
 [workspace]
 members = [
     "server",
+    "slices/echo",
 ]
 
 [profile.release]
 lto = "fat"
+panic = "abort"

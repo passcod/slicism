@@ -14,9 +14,9 @@
   )
 
   (func $dealloc (export "dealloc")
-    (param $mem i32)
-    (param $size i32)
-    (param $align i32)
+    (param $memory i32)
+    (param $offset i32)
+    (param $length i32)
   )
 
   (start $main)

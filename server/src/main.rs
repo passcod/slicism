@@ -27,7 +27,7 @@ use wasmer_runtime::{
     types::{TableIndex, Value as WasmValue},
     Ctx, Module,
 };
-use wasmer_runtime_core::module::ExportIndex;
+use wasmer_runtime_core::module::{ExportIndex, ModuleInfo};
 
 #[cfg(not(any(target_pointer_width = "32", target_pointer_width = "64")))]
 compile_error!("only 32 and 64 bit pointers are supported");
@@ -143,8 +143,8 @@ pub struct WasmAllocation {
 }
 
 impl WasmAllocation {
-    pub fn as_wasm_ptr(&self) -> PtrLen {
-        (self.offset, self.length)
+    pub fn as_wasm_ptr(&self) -> (u32, u32, u32) {
+        (self.memory, self.offset, self.length)
     }
 
     pub fn from_wasm(memory: u32, offset: u32, length: u32) -> Self {
@@ -153,6 +153,14 @@ impl WasmAllocation {
             offset,
             length,
         }
+    }
+
+    pub fn to_wasm(&self) -> [WasmValue; 3] {
+        [
+            WasmValue::I32(self.memory as _),
+            WasmValue::I32(self.offset as _),
+            WasmValue::I32(self.length as _),
+        ]
     }
 
     pub fn as_slice_range(&self) -> std::ops::Range<usize> {
@@ -223,12 +231,8 @@ fn wasm_alloc(ctx: &mut Ctx, index: TableIndex, layout: Layout) -> Result<WasmAl
 ///    recoverable and the instance should be considered crashed.
 ///
 #[allow(dead_code)] // not used, but keeping just in case
-fn wasm_dealloc(ctx: &mut Ctx, index: TableIndex, memory: u32, layout: Layout) -> Result<()> {
-    let memory = WasmValue::I32(memory as _);
-    let size = WasmValue::I32(layout.size() as _);
-    let align = WasmValue::I32(layout.align() as _);
-
-    ctx.call_with_table_index(index, &[memory, size, align])?;
+fn wasm_dealloc(ctx: &mut Ctx, index: TableIndex, alloc: &WasmAllocation) -> Result<()> {
+    ctx.call_with_table_index(index, &alloc.to_wasm())?;
     Ok(())
 }
 
@@ -280,6 +284,7 @@ pub struct LoadedSlice {
     module: Module,
     alloc_index: TableIndex,
     dealloc_index: TableIndex,
+    start: &'static str,
 }
 
 impl fmt::Debug for LoadedSlice {
@@ -303,8 +308,20 @@ impl fmt::Debug for LoadedSlice {
 impl LoadedSlice {
     pub fn new(source: &[u8], hash: u64) -> Result<Self> {
         let module = compile_wasm(source)?;
-        let alloc_index = Self::func_index(&module, "alloc")?;
-        let dealloc_index = Self::func_index(&module, "dealloc")?;
+        let info = module.info();
+
+        let alloc_index = Self::func_index(&info, "alloc")?;
+        let dealloc_index = Self::func_index(&info, "dealloc")?;
+
+        let start = {
+            const START_NAMES: [&'static str; 3] = ["slice_start", "wasi_start", "main"];
+
+            Self::func_index(&info, START_NAMES[0])
+                .map(|_| START_NAMES[0])
+                .or_else(|_| Self::func_index(&info, START_NAMES[1]).map(|_| START_NAMES[1]))
+                .or_else(|_| Self::func_index(&info, START_NAMES[2]).map(|_| START_NAMES[2]))
+                .map_err(|_| ErrorKind::WasmStartMissing)?
+        };
 
         Ok(Self {
             source_hash: hash,
@@ -314,12 +331,12 @@ impl LoadedSlice {
             decay: Arc::new(AtomicBool::new(false)),
             alloc_index,
             dealloc_index,
+            start,
         })
     }
 
-    fn func_index(module: &Module, name: &'static str) -> Result<TableIndex> {
-        let export_index = module
-            .info()
+    fn func_index(info: &ModuleInfo, name: &'static str) -> Result<TableIndex> {
+        let export_index = info
             .exports
             .get(name)
             .ok_or_else(|| ErrorKind::WasmExportMissing(name))?;
@@ -349,14 +366,23 @@ impl LoadedSlice {
 
         let imports = imports! {
             "env" => {
-                "log" => func!(|ctx: &mut Ctx, level: u8, mem: u32, ptr: u32, len: u32| {
+                "print_log" => func!(|ctx: &mut Ctx, level: u8, mem: u32, ptr: u32, len: u32| {
                     use log::Level::*;
+                    const LOG_ERROR: u8 = Error as u8;
+                    const LOG_WARN: u8 = Warn as u8;
+                    const LOG_INFO: u8 = Info as u8;
+                    const LOG_DEBUG: u8 = Debug as u8;
+                    const LOG_TRACE: u8 = Trace as u8;
                     let level = match level {
-                        0 => Error,
-                        1 => Warn,
-                        3 => Debug,
-                        4 => Trace,
-                        _ => Info,
+                        LOG_ERROR => Error,
+                        LOG_WARN => Warn,
+                        LOG_INFO => Info,
+                        LOG_DEBUG => Debug,
+                        LOG_TRACE => Trace,
+                        unk => {
+                            log::warn!("unknown error level used in wasm: {}", unk);
+                            Info
+                        },
                     };
 
                     let alloc = WasmAllocation::from_wasm(mem, ptr, len);
@@ -379,20 +405,22 @@ impl LoadedSlice {
                 "request_method" => {
                     let req = req.clone();
                     let alloc_index = self.alloc_index;
-                    func!(move |ctx: &mut Ctx| -> PtrLen {
+                    func!(move |ctx: &mut Ctx| -> (u32, u32, u32) {
                         wasm_alloc_and_write(ctx, alloc_index, &req.method).unwrap().as_wasm_ptr()
                     })
                 },
                 "request_uri" => {
                     let req = req.clone();
                     let alloc_index = self.alloc_index;
-                    func!(move |ctx: &mut Ctx| -> PtrLen {
-                        wasm_alloc_and_write(ctx, alloc_index, &req.uri).unwrap().as_wasm_ptr()
+                    func!(move |ctx: &mut Ctx, what: u32| {
+                        dbg!(what);
+                        // wasm_alloc_and_write(ctx, alloc_index, &req.uri).unwrap().as_wasm_ptr()
                     })
                 },
                 "response_status" => {
                     let res = res.clone();
                     func!(move |status: u16| -> u8 {
+                        log::debug!("response_status called");
                         match tide::http::StatusCode::from_u16(status) {
                             Ok(_) => {
                                 let mut res = res.lock().unwrap();
@@ -408,10 +436,14 @@ impl LoadedSlice {
                 "response_body" => {
                     let res = res.clone();
                     func!(move |ctx: &mut Ctx, mem: u32, ptr: u32, len: u32| {
+                        log::debug!("response_body called");
                         let alloc = WasmAllocation::from_wasm(mem, ptr, len);
+                        log::debug!("got alloc: {:?}", alloc);
                         let body = wasm_read(ctx, &alloc).unwrap();
+                        log::debug!("got body: {:?}", body);
                         let mut res = res.lock().unwrap();
                         res.body = body;
+                        log::debug!("wrote body");
                     })
                 },
             },
@@ -419,16 +451,22 @@ impl LoadedSlice {
 
         self.counter.fetch_add(1, Ordering::Relaxed);
 
-        // Instantiate and immediately drop. Why? Because instantiate runs the module's start
-        // function (equiv to main()). That runs everything the module should do, and has access to
-        // the imports above, plus we do ctx-wrangling to get to the alloc and dealloc exports.
-        // Thus, once the instantiate call is done, the module has fulfilled its purpose, and we
-        // trash it.
+        // Instantiate, call start, and immediately drop.
         //
         // This is what ensures isolation: each call to a module is a brand new instance, with no
         // shared state beyond safe loads and stores via us. We only compile bytecode once, though.
         {
-            self.module.instantiate(&imports)?;
+            match self
+                .module
+                .instantiate(&imports)?
+                .call(self.start, &[])?
+                .as_slice()
+            {
+                [WasmValue::I32(code)] => {
+                    exit.store(*code as _, Ordering::SeqCst);
+                }
+                _ => {}
+            }
         }
 
         match WasmError::from_wasm(exit.load(Ordering::SeqCst)) {
@@ -602,6 +640,11 @@ error_chain! {
             display("missing wasm export: {}", e)
         }
 
+        WasmStartMissing {
+            description("wasm start missing")
+            display("missing wasm start export: needs either of slice_start, wasi_start, main")
+        }
+
         WasmError(e: WasmError) {
             description("wasm internal error")
             display("wasm internal error: {:?} ({})", e, e.code())
@@ -720,6 +763,7 @@ fn main() -> Result<()> {
             ))
         })
         .level(log::LevelFilter::Info)
+        .level_for("slicism_server", log::LevelFilter::Trace)
         .chain(std::io::stderr())
         .apply()?;
 
