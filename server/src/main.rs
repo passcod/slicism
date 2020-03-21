@@ -644,7 +644,7 @@ error_chain! {
     }
 }
 
-async fn slicing(req: Request<S>) -> Result<Response> {
+async fn slicing(req: Request<Arc<State>>) -> Result<Response> {
     let state = req.state();
 
     let path = req.uri().path();
@@ -675,7 +675,6 @@ async fn slicing(req: Request<S>) -> Result<Response> {
     }
 }
 
-pub type S = Arc<State>;
 pub struct State {
     pub config: Slicefile,
     pub slices: Slices,
@@ -720,7 +719,7 @@ impl State {
     }
 }
 
-async fn handle(req: Request<S>) -> Response {
+async fn handle(req: Request<Arc<State>>) -> Response {
     let display_errors = req.state().config.display_errors;
     let uri = req.uri().clone();
 
