@@ -1,31 +1,28 @@
 use async_std::{fs, io::BufReader, prelude::*, task};
+use crossbeam::atomic::AtomicCell;
 use dashmap::DashMap;
 use error_chain::{bail, error_chain};
+use futures::channel::mpsc::unbounded;
 use indexmap::IndexMap;
 use num_derive::{FromPrimitive, ToPrimitive};
 use regex::Regex;
-use serde_derive::Deserialize;
+use serde_derive::{Deserialize, Serialize};
 use std::{
-    alloc::Layout,
     collections::{hash_map::DefaultHasher, BTreeMap},
-    convert::TryInto,
     ffi::OsStr,
     fmt,
     hash::Hasher,
-    mem::align_of,
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
     },
     time::SystemTime,
 };
 use tide::{Request, Response};
 use wasmer_runtime::{
-    compile as compile_wasm, func, imports,
-    types::{TableIndex, Value as WasmValue},
-    Ctx, Module,
+    compile as compile_wasm, func, imports, types::Value as WasmValue, Ctx, Module,
 };
 use wasmer_runtime_core::module::{ExportIndex, ModuleInfo};
 
@@ -108,8 +105,6 @@ pub struct Mapping {
     pub headers: IndexMap<String, String>,
 }
 
-type PtrLen = (u32, u32);
-
 #[derive(Debug, Clone, Copy, FromPrimitive, ToPrimitive, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WasmError {
@@ -135,40 +130,126 @@ impl WasmError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
+pub enum MetaFormat {
+    Cbor,
+    Json,
+    MsgPack,
+}
+
+impl MetaFormat {
+    pub fn names() -> Vec<String> {
+        [Self::Cbor, Self::Json, Self::MsgPack]
+            .iter()
+            .map(|f| f.to_string())
+            .collect()
+    }
+
+    pub fn new(name: &str) -> Result<Self> {
+        Ok(match name {
+            "cbor" => Self::Cbor,
+            "json" => Self::Json,
+            "msgpack" => Self::MsgPack,
+            name => bail!(ErrorKind::MetaFormatInvalid(name.to_string())),
+        })
+    }
+
+    pub fn generate<S: Send + Sync>(self, req: &Request<S>) -> Result<Vec<u8>> {
+        use tide::http::version::Version;
+
+        #[derive(Serialize)]
+        struct Meta<'m> {
+            pub version: (u8, u8),
+            pub method: &'m str,
+            pub uri: &'m str,
+            pub headers: Vec<(&'m [u8], &'m [u8])>,
+        }
+
+        let uri = req.uri().to_string();
+        let meta = Meta {
+            version: match req.version() {
+                Version::HTTP_09 => (0, 9),
+                Version::HTTP_10 => (1, 0),
+                Version::HTTP_11 => (1, 1),
+                Version::HTTP_2 => (2, 0),
+            },
+            method: req.method().as_str(),
+            uri: uri.as_str(),
+            headers: req
+                .headers()
+                .iter()
+                .map(|(key, value)| (key.as_ref(), value.as_bytes()))
+                .collect(),
+        };
+
+        Ok(match self {
+            Self::Cbor => serde_cbor::to_vec(&meta)?,
+            Self::Json => serde_json::to_vec(&meta)?,
+            Self::MsgPack => rmp_serde::to_vec(&meta)?,
+        })
+    }
+
+    pub fn parse(self, bytes: &[u8]) -> Result<Response> {
+        #[derive(Deserialize)]
+        struct Meta {
+            pub status: u16,
+            pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+        }
+
+        let meta: Meta = match self {
+            Self::Cbor => serde_cbor::from_slice(bytes)?,
+            Self::Json => serde_json::from_slice(bytes)?,
+            Self::MsgPack => rmp_serde::from_slice(bytes)?,
+        };
+
+        let mut res = tide::http::Response::builder();
+        res.status(meta.status);
+        for (key, value) in meta.headers {
+            res.header(key.as_slice(), value.as_slice());
+        }
+
+        let res = res.body(http_service::Body::empty())?;
+        Ok(res.into())
+    }
+}
+
+impl Default for MetaFormat {
+    fn default() -> Self {
+        Self::Cbor
+    }
+}
+
+impl fmt::Display for MetaFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Cbor => "cbor",
+                Self::Json => "json",
+                Self::MsgPack => "msgpack",
+            }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct WasmAllocation {
-    pub memory: u32,
     pub offset: u32,
     pub length: u32,
 }
 
 impl WasmAllocation {
-    pub fn as_wasm_ptr(&self) -> (u32, u32, u32) {
-        (self.memory, self.offset, self.length)
+    pub fn new(offset: u32, length: u32) -> Self {
+        Self { offset, length }
     }
 
-    pub fn from_wasm(memory: u32, offset: u32, length: u32) -> Self {
-        Self {
-            memory,
-            offset,
-            length,
-        }
+    pub fn as_slice_range(self) -> std::ops::Range<usize> {
+        self.into()
     }
 
-    pub fn to_wasm(&self) -> [WasmValue; 3] {
-        [
-            WasmValue::I32(self.memory as _),
-            WasmValue::I32(self.offset as _),
-            WasmValue::I32(self.length as _),
-        ]
-    }
-
-    pub fn as_slice_range(&self) -> std::ops::Range<usize> {
-        (self.offset as _)..((self.offset + self.length) as _)
-    }
-
-    pub fn check_against_memory(&self, ctx: &mut Ctx) -> Result<()> {
-        let max = ctx.memory(self.memory).size().bytes().0;
+    pub fn check_against_memory(self, ctx: &mut Ctx) -> Result<()> {
+        let max = ctx.memory(0).size().bytes().0;
         let max = if max > std::u32::MAX as usize {
             panic!("memory size of wasm is somehow > u32::MAX");
         } else {
@@ -184,95 +265,65 @@ impl WasmAllocation {
 
         Ok(())
     }
-}
 
-/// Allocate memory inside wasm
-///
-/// # Errors
-///
-///  - [`WasmError`](ErrorKind::WasmError)` containing [`WasmError::Alloc`], specifies that the
-///    allocation itself inside wasm failed. This may be recoverable (e.g. by growing the
-///    instance memory).
-///
-///  - [`WasmCall`](ErrorKind::WasmCall) is the call to the wasm instance failing. This is not
-///    recoverable and the instance should be considered crashed.
-///
-///  - [`WasmTypeMismatch`](ErrorKind::WasmTypeMismatch) means the wasm allocator returned the
-///    wrong type. This is not recoverable and the _module_ should be considered invalid.
-///
-fn wasm_alloc(ctx: &mut Ctx, index: TableIndex, layout: Layout) -> Result<WasmAllocation> {
-    let size: u32 = layout.size().try_into()?;
-    let align: u32 = layout.align().try_into()?;
-
-    let res = ctx.call_with_table_index(
-        index,
-        &[WasmValue::I32(size as _), WasmValue::I32(align as _)],
-    )?;
-
-    let (memory, offset, length) = match res.as_slice() {
-        [WasmValue::I32(mv), WasmValue::I32(ov), WasmValue::I32(sv)] => {
-            (*mv as u32, *ov as u32, *sv as u32)
+    pub fn write(self, ctx: &mut Ctx, bytes: &[u8]) -> Result<u32> {
+        if bytes.len() > self.length as _ {
+            bail!(ErrorKind::WasmAllocTooSmall(self.length, bytes.len() as _));
         }
-        _ => bail!(ErrorKind::WasmTypeMismatch("u32")),
-    };
 
-    Ok(WasmAllocation {
-        memory,
-        offset,
-        length,
-    })
-}
+        self.check_against_memory(ctx)?;
 
-/// De-allocate memory inside wasm
-///
-/// # Errors
-///
-///  - [`WasmCall`](ErrorKind::WasmCall) is the call to the wasm instance failing. This is not
-///    recoverable and the instance should be considered crashed.
-///
-#[allow(dead_code)] // not used, but keeping just in case
-fn wasm_dealloc(ctx: &mut Ctx, index: TableIndex, alloc: &WasmAllocation) -> Result<()> {
-    ctx.call_with_table_index(index, &alloc.to_wasm())?;
-    Ok(())
-}
+        log::trace!("writing {} bytes to {:?}", bytes.len(), self);
+        let view = ctx.memory(0).view::<u8>().atomically();
+        for (i, atom) in view[self.as_slice_range()].iter().enumerate() {
+            atom.store(bytes[i], Ordering::SeqCst);
+        }
 
-fn wasm_write(ctx: &mut Ctx, alloc: &WasmAllocation, bytes: &[u8]) -> Result<()> {
-    if bytes.len() > alloc.length as _ {
-        bail!(ErrorKind::WasmAllocTooSmall(alloc.length, bytes.len() as _));
+        Ok(bytes.len() as _)
     }
 
-    alloc.check_against_memory(ctx)?;
+    pub fn read(self, ctx: &mut Ctx) -> Result<Vec<u8>> {
+        self.check_against_memory(ctx)?;
 
-    let view = ctx.memory(alloc.memory).view::<u8>().atomically();
-    for (i, atom) in view[alloc.as_slice_range()].iter().enumerate() {
-        atom.store(bytes[i], Ordering::SeqCst);
+        log::trace!("reading from {:?}", self);
+        let mut buf: Vec<u8> = Vec::with_capacity(self.length as _);
+        let view = ctx.memory(0).view::<u8>().atomically();
+        for atom in view[self.as_slice_range()].iter() {
+            buf.push(atom.load(Ordering::SeqCst));
+        }
+
+        log::trace!("read {} bytes: {:?}", buf.len(), buf);
+        Ok(buf)
     }
-
-    Ok(())
 }
 
-fn wasm_alloc_and_write(
-    ctx: &mut Ctx,
-    alloc_index: TableIndex,
-    bytes: impl AsRef<[u8]>,
-) -> Result<WasmAllocation> {
-    let bytes = bytes.as_ref();
-    let layout = Layout::from_size_align(bytes.len(), align_of::<u8>())?;
-    let alloc = wasm_alloc(ctx, alloc_index, layout)?;
-    wasm_write(ctx, &alloc, bytes)?;
-    Ok(alloc)
+impl From<u64> for WasmAllocation {
+    fn from(raw: u64) -> Self {
+        let [o1, o2, o3, o4, l1, l2, l3, l4] = raw.to_le_bytes();
+        let offset = u32::from_le_bytes([o1, o2, o3, o4]);
+        let length = u32::from_le_bytes([l1, l2, l3, l4]);
+        Self::new(offset, length)
+    }
 }
 
-fn wasm_read(ctx: &mut Ctx, alloc: &WasmAllocation) -> Result<Vec<u8>> {
-    alloc.check_against_memory(ctx)?;
-
-    let mut buf: Vec<u8> = Vec::with_capacity(alloc.length as _);
-    let view = ctx.memory(alloc.memory).view::<u8>().atomically();
-    for atom in view[alloc.as_slice_range()].iter() {
-        buf.push(atom.load(Ordering::SeqCst));
+impl From<WasmAllocation> for std::ops::Range<usize> {
+    fn from(alloc: WasmAllocation) -> Self {
+        (alloc.offset as _)..((alloc.offset + alloc.length) as _)
     }
+}
 
-    Ok(buf)
+impl From<WasmAllocation> for u64 {
+    fn from(alloc: WasmAllocation) -> Self {
+        let [o1, o2, o3, o4] = alloc.offset.to_le_bytes();
+        let [l1, l2, l3, l4] = alloc.length.to_le_bytes();
+        u64::from_le_bytes([o1, o2, o3, o4, l1, l2, l3, l4])
+    }
+}
+
+impl From<WasmAllocation> for WasmValue {
+    fn from(alloc: WasmAllocation) -> Self {
+        WasmValue::I64(u64::from(alloc) as _)
+    }
 }
 
 #[derive(Clone)]
@@ -282,9 +333,8 @@ pub struct LoadedSlice {
     counter: Arc<AtomicUsize>,
     decay: Arc<AtomicBool>,
     module: Module,
-    alloc_index: TableIndex,
-    dealloc_index: TableIndex,
     start: &'static str,
+    meta_format: MetaFormat,
 }
 
 impl fmt::Debug for LoadedSlice {
@@ -295,12 +345,8 @@ impl fmt::Debug for LoadedSlice {
             .field("counter", &self.counter)
             .field("decay", &self.decay)
             .field("module", &"<compiled wasmer module>")
-            .field("alloc_index", &unsafe {
-                std::mem::transmute::<_, u32>(self.alloc_index)
-            })
-            .field("dealloc_index", &unsafe {
-                std::mem::transmute::<_, u32>(self.dealloc_index)
-            })
+            .field("start", &self.start)
+            .field("meta_format", &self.meta_format)
             .finish()
     }
 }
@@ -310,18 +356,14 @@ impl LoadedSlice {
         let module = compile_wasm(source)?;
         let info = module.info();
 
-        let alloc_index = Self::func_index(&info, "alloc")?;
-        let dealloc_index = Self::func_index(&info, "dealloc")?;
+        let start = Self::detect_start(&info, "slice_start")?;
 
-        let start = {
-            const START_NAMES: [&'static str; 3] = ["slice_start", "wasi_start", "main"];
-
-            Self::func_index(&info, START_NAMES[0])
-                .map(|_| START_NAMES[0])
-                .or_else(|_| Self::func_index(&info, START_NAMES[1]).map(|_| START_NAMES[1]))
-                .or_else(|_| Self::func_index(&info, START_NAMES[2]).map(|_| START_NAMES[2]))
-                .map_err(|_| ErrorKind::WasmStartMissing)?
-        };
+        let meta_format = info
+            .custom_sections
+            .get("slicism-meta-format")
+            .and_then(|sections| sections.last())
+            .and_then(|name| MetaFormat::new(&String::from_utf8_lossy(name)).ok())
+            .unwrap_or_default();
 
         Ok(Self {
             source_hash: hash,
@@ -329,22 +371,23 @@ impl LoadedSlice {
             created: SystemTime::now(),
             counter: Arc::new(AtomicUsize::new(0)),
             decay: Arc::new(AtomicBool::new(false)),
-            alloc_index,
-            dealloc_index,
             start,
+            meta_format,
         })
     }
 
-    fn func_index(info: &ModuleInfo, name: &'static str) -> Result<TableIndex> {
-        let export_index = info
-            .exports
+    fn detect_start<'name>(info: &ModuleInfo, name: &'name str) -> Result<&'name str> {
+        log::trace!("looking up func: {}", name);
+        info.exports
             .get(name)
-            .ok_or_else(|| ErrorKind::WasmExportMissing(name))?;
-        if let ExportIndex::Func(func_index) = export_index {
-            Ok(unsafe { std::mem::transmute(*func_index) })
-        } else {
-            bail!(ErrorKind::WasmExportMissing(name))
-        }
+            .ok_or_else(|| ErrorKind::WasmStartMissing.into())
+            .and_then(|index| {
+                if let ExportIndex::Func(_) = index {
+                    Ok(name)
+                } else {
+                    bail!(ErrorKind::WasmStartMissing)
+                }
+            })
     }
 
     pub fn source_hash(&self) -> u64 {
@@ -360,13 +403,17 @@ impl LoadedSlice {
     }
 
     pub fn bite<S: Send + Sync>(&self, req: &Request<S>) -> Result<Response> {
-        let req = Arc::new(FlatRequest::from(req));
-        let res = Arc::new(Mutex::new(FlatResponse::new()));
-        let exit = Arc::new(AtomicU8::new(0));
+        let req_meta = self.meta_format.generate(req)?;
+        let req_meta_size = req_meta.len() as _;
+
+        let (body_sen, body_rec) = unbounded();
+
+        let meta_sen = Arc::new(AtomicCell::default());
+        let meta_rec = meta_sen.clone();
 
         let imports = imports! {
             "env" => {
-                "print_log" => func!(|ctx: &mut Ctx, level: u8, mem: u32, ptr: u32, len: u32| {
+                "print_log" => func!(|ctx: &mut Ctx, level: u8, alloc: u64| {
                     use log::Level::*;
                     const LOG_ERROR: u8 = Error as u8;
                     const LOG_WARN: u8 = Warn as u8;
@@ -382,134 +429,56 @@ impl LoadedSlice {
                         unk => {
                             log::warn!("unknown error level used in wasm: {}", unk);
                             Info
-                        },
+                        }
                     };
 
-                    let alloc = WasmAllocation::from_wasm(mem, ptr, len);
-                    let message = wasm_read(ctx, &alloc).unwrap();
+                    let message = WasmAllocation::from(alloc).read(ctx).unwrap();
                     let message = String::from_utf8_lossy(&message);
                     log::log!(level, "{}", message);
                 }),
-                "exit_get" => {
-                    let exit = exit.clone();
-                    func!(move || -> u8 {
-                        exit.load(Ordering::Acquire)
-                    })
-                },
-                "exit_set" => {
-                    let exit = exit.clone();
-                    func!(move |s: u8| {
-                        exit.store(s, Ordering::Release)
-                    })
-                },
-                "request_method" => {
-                    let req = req.clone();
-                    let alloc_index = self.alloc_index;
-                    func!(move |ctx: &mut Ctx| -> (u32, u32, u32) {
-                        wasm_alloc_and_write(ctx, alloc_index, &req.method).unwrap().as_wasm_ptr()
-                    })
-                },
-                "request_uri" => {
-                    let req = req.clone();
-                    let alloc_index = self.alloc_index;
-                    func!(move |ctx: &mut Ctx, what: u32| {
-                        dbg!(what);
-                        // wasm_alloc_and_write(ctx, alloc_index, &req.uri).unwrap().as_wasm_ptr()
-                    })
-                },
-                "response_status" => {
-                    let res = res.clone();
-                    func!(move |status: u16| -> u8 {
-                        log::debug!("response_status called");
-                        match tide::http::StatusCode::from_u16(status) {
-                            Ok(_) => {
-                                let mut res = res.lock().unwrap();
-                                res.status = status;
-                                WasmError::None
-                            }
-                            Err(_) => {
-                                WasmError::StatusOutOfBounds
-                            }
-                        }.code()
-                    })
-                },
-                "response_body" => {
-                    let res = res.clone();
-                    func!(move |ctx: &mut Ctx, mem: u32, ptr: u32, len: u32| {
-                        log::debug!("response_body called");
-                        let alloc = WasmAllocation::from_wasm(mem, ptr, len);
-                        log::debug!("got alloc: {:?}", alloc);
-                        let body = wasm_read(ctx, &alloc).unwrap();
-                        log::debug!("got body: {:?}", body);
-                        let mut res = res.lock().unwrap();
-                        res.body = body;
-                        log::debug!("wrote body");
-                    })
-                },
+
+                "size_meta" => func!(move || -> u32 { req_meta_size }),
+
+                "read_meta" => func!(move |ctx: &mut Ctx, alloc: u64| -> i32 {
+                    WasmAllocation::from(alloc).write(ctx, &req_meta).map(|len| len as _).unwrap_or(-1)
+                }),
+
+                "read_body" => func!(move |ctx: &mut Ctx, alloc: u64| -> i32 {
+                    let body_available = b"todo";
+                    let alloc = WasmAllocation::from(alloc);
+                    alloc.write(ctx, &body_available[0..(alloc.length as _)]).map(|len| len as _).unwrap_or(-1)
+                }),
+
+                "write_meta" => func!(move |ctx: &mut Ctx, alloc: u64| -> i32 {
+                    WasmAllocation::from(alloc).read(ctx).and_then(|meta| {
+                        let len = meta.len() as _;
+                        log::debug!("write_meta read {} bytes: {:?}", len, meta);
+                        meta_sen.store(meta);
+                        Ok(len)
+                    }).unwrap_or(-1)
+                }),
+
+                "write_body" => func!(move |ctx: &mut Ctx, alloc: u64| -> i32 {
+                    WasmAllocation::from(alloc).read(ctx).and_then(|body| {
+                        let len = body.len() as _;
+                        log::debug!("write_body read {} bytes: {:?}", len, body);
+                        body_sen.unbounded_send(body)?;
+                        Ok(len)
+                    }).unwrap_or(-1)
+                }),
             },
         };
 
         self.counter.fetch_add(1, Ordering::Relaxed);
 
-        // Instantiate, call start, and immediately drop.
-        //
-        // This is what ensures isolation: each call to a module is a brand new instance, with no
-        // shared state beyond safe loads and stores via us. We only compile bytecode once, though.
-        {
-            match self
-                .module
-                .instantiate(&imports)?
-                .call(self.start, &[])?
-                .as_slice()
-            {
-                [WasmValue::I32(code)] => {
-                    exit.store(*code as _, Ordering::SeqCst);
-                }
-                _ => {}
-            }
-        }
+        self.module.instantiate(&imports)?.call(self.start, &[])?;
 
-        match WasmError::from_wasm(exit.load(Ordering::SeqCst)) {
-            WasmError::None => Ok(res.lock().unwrap().clone().into()),
-            error => bail!(ErrorKind::WasmError(error)),
-        }
-    }
-}
+        let res = self.meta_format.parse(&meta_rec.take())?;
 
-#[derive(Clone, Debug)]
-struct FlatRequest {
-    pub method: String,
-    pub uri: String,
-}
+        // let cursor = futures::io::Cursor::new(res.body);
+        // res.body(cursor)
 
-impl<S> From<&Request<S>> for FlatRequest {
-    fn from(req: &Request<S>) -> Self {
-        Self {
-            method: req.method().to_string(),
-            uri: req.uri().to_string(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct FlatResponse {
-    pub status: u16,
-    pub body: Vec<u8>,
-}
-
-impl FlatResponse {
-    fn new() -> Self {
-        Self {
-            status: 501,
-            body: Vec::new(),
-        }
-    }
-}
-
-impl From<FlatResponse> for Response {
-    fn from(res: FlatResponse) -> Self {
-        let cursor = futures::io::Cursor::new(res.body);
-        Self::new(res.status).body(cursor)
+        Ok(res)
     }
 }
 
@@ -615,13 +584,26 @@ error_chain! {
         Io(::std::io::Error);
         Layout(::std::alloc::LayoutErr);
         Log(::log::SetLoggerError);
+
+        Cbor(::serde_cbor::error::Error);
+        Json(::serde_json::error::Error);
+        MsgPackDecode(::rmp_serde::decode::Error);
+        MsgPackEncode(::rmp_serde::encode::Error);
         Toml(::toml::de::Error);
+
+        BodyChannel(::futures::channel::mpsc::TrySendError<Vec<u8>>);
+        InvalidResponse(::tide::http::Error);
+
         WasmCompilation(::wasmer_runtime_core::error::CompileError);
         WasmInstantiation(::wasmer_runtime::error::Error);
-        WasmCall(::wasmer_runtime_core::error::CallError);
+        WasmResolve(::wasmer_runtime_core::error::ResolveError);
+        WasmCallOld(::wasmer_runtime_core::error::CallError);
+        WasmCall(::wasmer_runtime_core::error::RuntimeError);
     }
 
     errors {
+        Unreachable {}
+
         WasmInvalid {
             description("file is invalid wasm")
         }
@@ -633,11 +615,6 @@ error_chain! {
         WasmTypeMismatch(expected: &'static str) {
             description("unexpected type returned from wasm")
             display("unexpected type returned from wasm, expected {}", expected)
-        }
-
-        WasmExportMissing(e: &'static str) {
-            description("wasm export missing")
-            display("missing wasm export: {}", e)
         }
 
         WasmStartMissing {
@@ -659,13 +636,18 @@ error_chain! {
             description("wasm memory is too small")
             display("wasm memory is {} bytes, wanted {} bytes", memory, wanted)
         }
+
+        MetaFormatInvalid(name: String) {
+            description("invalid meta format requested")
+            display("requested unavailable meta format: {}, possibilities: {}", name, MetaFormat::names().join(", "))
+        }
     }
 }
 
 async fn slicing(req: Request<S>) -> Result<Response> {
     let state = req.state();
 
-    let path = req.uri();
+    let path = req.uri().path();
     // todo: mappings
     let path = state
         .config
