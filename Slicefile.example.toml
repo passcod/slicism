@@ -1,0 +1,60 @@
+# The address to bind the server to. This can be anything that parses or
+# resolves to an IP address and port, including domain names. The default is
+# 127.0.0.1:8080. You'll need sufficient privileges to bind and listen there.
+#
+bind = "0.0.0.0:7269"
+
+# How much to log. The "Server is listening" log is always printed, regardless
+# of this value, as well as some early diagnostic messages in debug builds.
+# Otherwise, values are: trace, debug, info (the default), warn, error, off.
+#
+log_level = "trace"
+
+# The document root of the server. When looking up files, the server will start
+# from there and won't look higher. Wasm files will get executed, other files
+# will get output verbatim. The default is the current working directory.
+#
+root = "./slices"
+
+# Whether errors should get returned with the HTTP response or output on the
+# server logs. In production, this should be false (the default). In
+# development, it can be useful to turn on.
+#
+display_errors = true
+
+# Whether static files should be handled (returned verbatim). In production,
+# Slicism should be behind a reverse proxy that handles files properly, with
+# all the support for streaming, resuming, caching, etc. In development, it's
+# often useful to have slicism do that for you. The default is off.
+#
+static_files = true
+
+# Whether the document root should be walked at start time and all wasm programs
+# found within loaded pre-emptively. This is recommended in production, as it
+# effectively removes cold starts. However, it increases start up time and also
+# increases memory use. Also consider the gc options when configuring this.
+# Default is off.
+# (not yet implemented)
+#
+preload = true
+
+# Configuration for garbage collection (gc) of loaded wasm programs. This is a
+# simple mark-and-sweep collector: at every interval, all marked programs are
+# unloaded, and all remaining programs are marked; on use, programs unmark
+# themselves. Unloaded programs are loaded from file and compiled on next use.
+#
+[gc]
+
+# The interval the gc runs at. Syntax is everything the humantime crate supports,
+# e.g. "5min 30s", "1h", "2week". Defaults to 5 minutes.
+#
+interval = "2months"
+
+# The collector also sweeps invalid program tombstones. These are markers that
+# indicate a program at a path and with a certain content (checksummed) has
+# already been attempted to be loaded and was found invalid, so Slicism skips
+# it early rather than retrying. These tombstones can pile up in memory,
+# especially in development, if there are many changes. This value controls how
+# many such tombstones should be kept. Defaults to 100.
+#
+keep_invalids = 5000

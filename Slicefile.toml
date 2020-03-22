@@ -1,5 +1,6 @@
 bind = "0.0.0.0:8080"
 display_errors = true
+log_level = "trace"
 
 [gc]
 interval = "30s"
