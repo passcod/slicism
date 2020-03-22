@@ -285,7 +285,7 @@ impl WasmAllocation {
             buf.push(atom.load(Ordering::SeqCst));
         }
 
-        log::trace!("read {} bytes: {:?}", buf.len(), buf);
+        log::trace!("read {} bytes: {:x?}", buf.len(), buf);
         Ok(buf)
     }
 }
@@ -484,68 +484,87 @@ impl Slices {
     }
 
     pub async fn load(&self, path: PathBuf, mut file: fs::File) -> Result<()> {
-        // todo: debug logging throughout here
+        log::trace!("{}: looking up slice", path.display());
 
+        // always lookup the time so if the file doesn't exist anymore we error
         let meta = file.metadata().await?;
         let modtime = meta.modified().or_else(|_| meta.created())?;
+        log::trace!("{}: timestamp is {:?}", path.display(), modtime);
 
         if let Some(r) = self.from_path.get(&path) {
             let hash = r.value();
+            log::trace!("{}: from_path cache hit: {:x}", path.display(), hash);
+
             if let Some(r) = self.from_hash.get(&hash) {
                 match r.value() {
                     Slice::InvalidWasm { seen } if modtime <= *seen => {
+                        log::trace!("{}: from_hash cache hit: invalid tombstone", path.display());
                         bail!(ErrorKind::WasmInvalid)
                     }
                     Slice::Loaded(LoadedSlice { created, .. }) if modtime < *created => {
-                        return Ok(())
+                        log::trace!("{}: from_hash cache hit: already loaded", path.display());
+                        return Ok(());
                     } // already loaded
                     _ => {
+                        log::trace!("{}: from_hash cache hit: modtime expired", path.display());
                         // needs a re-hash
                     }
                 }
             } else {
+                log::trace!("{}: from_hash cache miss: from_path stale", path.display());
                 // the from_path entry is stale
                 self.from_path.remove(&path);
             }
-        } // else: new entry
+        } else {
+            log::trace!("{}: from_path cache miss", path.display());
+            // new entry
+        }
 
+        log::trace!("{}: reading file", path.display());
         let mut full = Vec::new();
         file.read_to_end(&mut full).await?;
+        log::trace!("{}: read {} bytes", path.display(), full.len());
 
         // todo: stream the file to hash first before committing to load
         // it entirely in memory once we absolutely know that's needed.
+        log::trace!("{}: hashing file", path.display());
         let mut hasher = DefaultHasher::new();
         hasher.write(&full);
         let hash = hasher.finish();
+        log::trace!("{}: hash: {:x}", path.display(), hash);
 
         if let Some(r) = self.from_hash.get(&hash) {
             match r.value() {
                 Slice::InvalidWasm { .. } => {
+                    log::trace!("{}: from_hash cache hit: invalid tombstone", path.display());
                     // we already know it's bad, so bail
                     self.from_path.insert(path, hash);
                     bail!(ErrorKind::WasmInvalid);
                 }
                 Slice::Loaded(_) => {
+                    log::trace!("{}: from_hash cache hit: already loaded", path.display());
                     // we already know it's good, so bail
                     self.from_path.insert(path, hash);
                     return Ok(());
                 }
             }
-        } // else: new entry
+        } else {
+            log::trace!("{}: from_hash cache miss", path.display());
+            // new entry
+        }
 
+        log::debug!("{}: compile", path.display());
         match LoadedSlice::new(&full, hash) {
             Ok(slice) => {
+                log::debug!("{}: success, caching", path.display());
                 self.from_hash.insert(hash, Slice::Loaded(slice));
                 self.from_path.insert(path, hash);
                 Ok(())
             }
             Err(err) => {
-                log::error!(
-                    "error loading wasm file={} hash={}: {}",
-                    path.display(),
-                    hash,
-                    err
-                );
+                log::error!("{}: error: {}", path.display(), err);
+
+                log::trace!("{}: clearing caches", path.display());
                 self.from_hash.insert(
                     hash,
                     Slice::InvalidWasm {
@@ -553,6 +572,7 @@ impl Slices {
                     },
                 );
                 self.from_path.insert(path, hash);
+
                 bail!(ErrorKind::WasmInvalid)
             }
         }
@@ -606,33 +626,51 @@ error_chain! {
 }
 
 async fn slicing(req: Request<Arc<State>>) -> Result<Response> {
+    let path = req.uri().path();
+    log::debug!("{}: got request, start slicing", path);
+
     let state = req.state();
 
-    let path = req.uri().path();
+    // log::trace!("{}: lookup mappings", path);
+    let mapped = path.trim_start_matches('/').to_string();
     // todo: mappings
-    let path = state
-        .config
-        .root
-        .join(path.to_string().trim_start_matches('/'));
+    // log::trace!("{}: mapped to {}", path, mapped);
+
+    let canon = state.config.root.join(mapped);
+    log::trace!("{}: canonicalized: {}", path, canon.display());
+
     // todo: check that we're still in root (security)
-    let file = fs::File::open(&path).await?;
+
+    log::trace!("{}: opening file", path);
+    let file = fs::File::open(&canon).await?;
     //^ todo: 404 if file does not exist, 401 for wrong permission, 500 for i/o
 
-    if path.extension() == Some(OsStr::new("wasm")) {
-        // wasm!
-        state.slices.load(path.clone(), file).await?;
-        match state.slices.get_loaded(path) {
+    if canon.extension() == Some(OsStr::new("wasm")) {
+        log::trace!("{}: looks like wasm", path);
+
+        state.slices.load(canon.clone(), file).await?;
+        match state.slices.get_loaded(canon) {
             Some(Slice::Loaded(slice)) => {
+                let path = path.to_string(); // for logging
+                log::debug!("{}: got wasm, take a bite", path);
                 let res = slice.bite(req)?;
-                dbg!(&slice.counter);
+                log::debug!("{}: success, responding", path);
                 Ok(res)
             }
-            Some(Slice::InvalidWasm { .. }) => Ok(Response::new(500)),
-            None => Ok(Response::new(404)),
+            Some(Slice::InvalidWasm { .. }) => {
+                log::debug!("{}: invalid tombstone => 500", path);
+                Ok(Response::new(500))
+            }
+            None => {
+                log::debug!("{}: nothing there => 404", path);
+                Ok(Response::new(404))
+            }
         }
     } else if state.config.static_files {
+        log::trace!("{}: static file, outputting", path);
         Ok(Response::with_reader(200, BufReader::new(file)))
     } else {
+        log::trace!("{}: static file, 404", path);
         Ok(Response::new(404))
     }
 }
