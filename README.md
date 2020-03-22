@@ -51,7 +51,7 @@ Non-critical production, but like, exposed to the internet and everything.
 
 Thanks!
 
-## I'm really bored / somehow interested / not entirely quite right / want to use this
+## I'm really bored / somewhat curious / interested and want to use it
 
 Okay! You can do this.
 
