@@ -31,7 +31,7 @@ In rough order.
 - [x] Static files (for dev ease, production should use nginx)
 - [ ] Access to the world for Wasm (at least reading the filesystem)
 - [ ] Error value mapping
-- [ ] Logging control in config
+- [x] Logging control in config
 - [ ] Logging cleanup
 - [ ] Investigate why memory isn't dropped completely after each request
 - [ ] Stats (in statsd/influx format, to some UDP/TCP/file as configured)
@@ -101,6 +101,12 @@ the file at the moment.
 # 127.0.0.1:8080. You'll need sufficient privileges to bind and listen there.
 #
 bind = "0.0.0.0:7269"
+
+# How much to log. The "Server is listening" log is always printed, regardless
+# of this value, as well as some early diagnostic messages in debug builds.
+# Otherwise, values are: trace, debug, info (the default), warn, error, off.
+#
+log_level = "trace"
 
 # The document root of the server. When looking up files, the server will start
 # from there and won't look higher. Wasm files will get executed, other files

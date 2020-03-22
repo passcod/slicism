@@ -31,6 +31,10 @@ fn default_bind() -> SocketAddr {
     "127.0.0.1:8080".parse().unwrap()
 }
 
+fn default_log_level() -> String {
+    "info".into()
+}
+
 fn default_path() -> PathBuf {
     ".".into()
 }
@@ -39,6 +43,8 @@ fn default_path() -> PathBuf {
 pub struct Slicefile {
     #[serde(default = "default_bind")]
     pub bind: SocketAddr,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
     #[serde(default = "default_path")]
     pub root: PathBuf,
     #[serde(default)]
@@ -764,26 +770,75 @@ async fn handle(req: Request<Arc<State>>) -> Response {
     })
 }
 
+macro_rules! prelog {
+    ($logger:expr, $args:expr) => {
+        #[cfg(debug_assertions)]
+        {
+            $logger.log(
+                &::log::Record::builder()
+                    .args($args)
+                    .level(::log::Level::Error)
+                    .build(),
+            );
+        }
+    };
+}
+
 fn main() -> Result<()> {
-    fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "{}\t[{}] {}",
-                record.level(),
-                record.target(),
-                message
-            ))
-        })
+    #[cfg(debug_assertions)]
+    let (_, prelogger) = fern::Dispatch::new()
+        .format(|out, message, _| out.finish(format_args!("PRELOAD\t|| {}", message)))
         .level(log::LevelFilter::Info)
-        .level_for("slicism_server", log::LevelFilter::Trace)
         .chain(std::io::stderr())
-        .apply()?;
+        .into_log();
+
+    prelog!(prelogger, format_args!("starting slicism"));
 
     task::block_on(async {
+        prelog!(prelogger, format_args!("loading config"));
         let mut slicefile: Slicefile =
             toml::from_str(&fs::read_to_string("Slicefile.toml").await?)?;
+
+        prelog!(prelogger, format_args!("normalising config"));
         slicefile.normalise().await?;
-        dbg!(&slicefile);
+
+        prelog!(
+            prelogger,
+            format_args!(
+                "initialising real logger with log_level = {}",
+                slicefile.log_level
+            )
+        );
+
+        fern::Dispatch::new()
+            .format(|out, message, record| {
+                out.finish(format_args!(
+                    "{}\t[{}] {}",
+                    record.level(),
+                    record.target(),
+                    message
+                ))
+            })
+            .chain(std::io::stderr())
+            .level(log::LevelFilter::Info)
+            .level_for("slicism_server", {
+                use log::LevelFilter::*;
+                let level = match slicefile.log_level.as_str() {
+                    "trace" => Trace,
+                    "debug" => Debug,
+                    "info" => Info,
+                    "warn" => Warn,
+                    "error" => Error,
+                    "off" => Off,
+                    _ => Info,
+                };
+                prelog!(prelogger, format_args!("parsed log_level to {:?}", level));
+                level
+            })
+            .apply()?;
+
+        log::debug!("slicefile: {:#?}", slicefile);
+
         let state = State::new(slicefile);
 
         let mut app = tide::with_state(state.clone());
