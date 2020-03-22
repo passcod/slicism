@@ -21,9 +21,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tide::{Request, Response};
-use wasmer_runtime::{
-    compile as compile_wasm, func, imports, types::Value as WasmValue, Ctx, Module,
-};
+use wasmer_runtime::{compile as compile_wasm, func, imports, Ctx, Module};
 use wasmer_runtime_core::module::{ExportIndex, ModuleInfo};
 
 #[cfg(not(any(target_pointer_width = "32", target_pointer_width = "64")))]
@@ -228,7 +226,7 @@ impl fmt::Display for MetaFormat {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct WasmAllocation {
+struct WasmAllocation {
     pub offset: u32,
     pub length: u32,
 }
@@ -291,32 +289,9 @@ impl WasmAllocation {
     }
 }
 
-impl From<u64> for WasmAllocation {
-    fn from(raw: u64) -> Self {
-        let [o1, o2, o3, o4, l1, l2, l3, l4] = raw.to_le_bytes();
-        let offset = u32::from_le_bytes([o1, o2, o3, o4]);
-        let length = u32::from_le_bytes([l1, l2, l3, l4]);
-        Self::new(offset, length)
-    }
-}
-
 impl From<WasmAllocation> for std::ops::Range<usize> {
     fn from(alloc: WasmAllocation) -> Self {
         (alloc.offset as _)..((alloc.offset + alloc.length) as _)
-    }
-}
-
-impl From<WasmAllocation> for u64 {
-    fn from(alloc: WasmAllocation) -> Self {
-        let [o1, o2, o3, o4] = alloc.offset.to_le_bytes();
-        let [l1, l2, l3, l4] = alloc.length.to_le_bytes();
-        u64::from_le_bytes([o1, o2, o3, o4, l1, l2, l3, l4])
-    }
-}
-
-impl From<WasmAllocation> for WasmValue {
-    fn from(alloc: WasmAllocation) -> Self {
-        WasmValue::I64(u64::from(alloc) as _)
     }
 }
 
@@ -409,7 +384,7 @@ impl LoadedSlice {
 
         let imports = imports! {
             "env" => {
-                "print_log" => func!(|ctx: &mut Ctx, level: u8, alloc: u64| {
+                "print_log" => func!(|ctx: &mut Ctx, level: u8, offset: u32, length: u32| {
                     use log::Level::*;
                     const LOG_ERROR: u8 = Error as u8;
                     const LOG_WARN: u8 = Warn as u8;
@@ -428,19 +403,19 @@ impl LoadedSlice {
                         }
                     };
 
-                    let message = WasmAllocation::from(alloc).read(ctx).unwrap();
+                    let message = WasmAllocation::new(offset, length).read(ctx).unwrap();
                     let message = String::from_utf8_lossy(&message);
                     log::log!(level, "{}", message);
                 }),
 
                 "size_meta" => func!(move || -> u32 { req_meta_size }),
 
-                "read_meta" => func!(move |ctx: &mut Ctx, alloc: u64| -> i32 {
-                    WasmAllocation::from(alloc).write(ctx, &req_meta).map(|len| len as _).unwrap_or(-1)
+                "read_meta" => func!(move |ctx: &mut Ctx, offset: u32, length: u32| -> i32 {
+                    WasmAllocation::new(offset, length).write(ctx, &req_meta).map(|len| len as _).unwrap_or(-1)
                 }),
 
-                "read_body" => func!(move |ctx: &mut Ctx, alloc: u64| -> i32 {
-                    let alloc = WasmAllocation::from(alloc);
+                "read_body" => func!(move |ctx: &mut Ctx, offset: u32, length: u32| -> i32 {
+                    let alloc = WasmAllocation::new(offset, length);
                     let mut buf = vec![0; alloc.length as _];
                     task::block_on(async {
                         let mut req = body_lock.lock().await;
@@ -450,10 +425,9 @@ impl LoadedSlice {
                     }).map(|len| len as _).unwrap_or(-1)
                 }),
 
-                "write_meta" => func!(move |ctx: &mut Ctx, alloc: u64| -> i32 {
-                    WasmAllocation::from(alloc).read(ctx).and_then(|meta| {
+                "write_meta" => func!(move |ctx: &mut Ctx, offset: u32, length: u32| -> i32 {
+                    WasmAllocation::new(offset, length).read(ctx).and_then(|meta| {
                         let len = meta.len() as _;
-                        log::debug!("write_meta read {} bytes: {:?}", len, meta);
                         meta_sen.store(meta);
                         Ok(len)
                     }).unwrap_or(-1)
@@ -465,10 +439,9 @@ impl LoadedSlice {
                     -1
                 }),
 
-                "write_body" => func!(move |ctx: &mut Ctx, alloc: u64| -> i32 {
-                    WasmAllocation::from(alloc).read(ctx).and_then(|body| {
+                "write_body" => func!(move |ctx: &mut Ctx, offset: u32, length: u32| -> i32 {
+                    WasmAllocation::new(offset, length).read(ctx).and_then(|body| {
                         let len = body.len() as _;
-                        log::debug!("write_body read {} bytes: {:?}", len, body);
                         body_sen.unbounded_send(body)?;
                         Ok(len)
                     }).unwrap_or(-1)

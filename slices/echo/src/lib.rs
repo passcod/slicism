@@ -83,14 +83,14 @@ struct ResponseMeta<'m> {
 }
 
 extern "C" {
-    fn print_log(level: log::Level, alloc: u64);
+    fn print_log(level: log::Level, offset: u32, length: u32);
 
     fn size_meta() -> u32;
-    fn read_meta(alloc: u64) -> i32;
-    fn read_body(alloc: u64) -> i32;
+    fn read_meta(offset: u32, length: u32) -> i32;
+    fn read_body(offset: u32, length: u32) -> i32;
 
-    fn write_meta(alloc: u64) -> i32;
-    fn write_body(alloc: u64) -> i32;
+    fn write_meta(offset: u32, length: u32) -> i32;
+    fn write_body(offset: u32, length: u32) -> i32;
 }
 
 struct Logger;
@@ -103,8 +103,9 @@ impl log::Log for Logger {
 
     fn log(&self, record: &log::Record) {
         let message = format!("{}", record.args());
+        let alloc = SliceAlloc::from(message.as_str());
         unsafe {
-            print_log(record.level(), SliceAlloc::from(message.as_str()).into());
+            print_log(record.level(), alloc.offset, alloc.length);
         }
     }
 
@@ -122,7 +123,7 @@ pub fn main() {
 
     let mut meta_raw = vec![0; unsafe { size_meta() } as _];
     let meta_alloc = SliceAlloc::from(meta_raw.as_slice());
-    let meta_read = unsafe { read_meta(meta_alloc.into()) };
+    let meta_read = unsafe { read_meta(meta_alloc.offset, meta_alloc.length) };
     if meta_read < 0 {
         log::error!("error reading meta!");
         return;
@@ -142,7 +143,7 @@ pub fn main() {
 
     log::debug!("res meta: {:?}", res);
     let res_alloc = SliceAlloc::from(res.as_slice());
-    let written = unsafe { write_meta(res_alloc.into()) };
+    let written = unsafe { write_meta(res_alloc.offset, res_alloc.length) };
     if written < 0 {
         log::error!("error writing meta!");
     }

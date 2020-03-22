@@ -166,18 +166,12 @@ experience ergonomic, but it is not required. (to be implemented)
 
 #### Types
 
-There are two important types to know about when using the interface:
+There are two important semantic types to know about when using the interface:
 allocations and io results.
 
-Allocations are `i64` values at the wasm level, but should be interpreted as
-`(u32, u32)`: two u32 values laid out next to each other. To read, cast the
-`i64` as `u64`, read all eight bytes in little-endian order, then write the
-first four bytes in little-endian to `u32`, and similarly for the last four.
-
-To write, perform the reverse operation.
-
-Allocations encode an offset (pointer) and length inside the wasm memory, and
-are used to ask the host for data to be read from or written to wasm memory.
+Allocations are two `i32` values provided together, but should be cast as two
+`u32` values. They are an offset (pointer) and length inside the wasm memory,
+and are used to ask the host for data to be read from or written to wasm memory.
 
 I/O Results are `i32` values. Positive (including zero) values indicate the
 amount of bytes read or written. Negative values indicate an error. There is no
@@ -187,9 +181,9 @@ mapping from error values to error kinds yet.
 
 The import namespace is `env` (the de-facto default for wasm modules).
 
-##### `(func (import "env" "print_log") (param i32 i64))`
+##### `(func (import "env" "print_log") (param i32 i32 i32))`
 
-Interpreted as: `fn print_log(level: u8, alloc: u64)`.
+Interpreted as: `fn print_log(level: u8, offset: u32, length: u32)`.
 
 Prints a log message to the server log. The level corresponds to the Rust
 log::Level enum values. Currently:
@@ -214,9 +208,9 @@ This is the size of the request metadata blob. When allocating space to read
 that, you'll need to allocate at least that. Partial metadata reads aren't
 supported, so that's non-negotiable unless you don't want to read request meta.
 
-##### `(func (import "env" "read_meta") (param i64) (result i32))`
+##### `(func (import "env" "read_meta") (param i32 i32) (result i32))`
 
-Interpreted as `fn read_meta(alloc: u64) -> i32`.
+Interpreted as `fn read_meta(offset: u32, length: u32) -> i32`.
 
 Writes the request meta blob into an allocation. Returns an I/O result.
 
@@ -266,9 +260,9 @@ headers are somewhat more restrained than UTF-8 or ASCII: only byte values
 between 32 and 255 (inclusive) are permitted, excluding byte 127 (DEL).
 Header names must in addition be all-lowercase.
 
-##### `(func (import "env" "write_meta") (param i64) (result i32))`
+##### `(func (import "env" "write_meta") (param i32 i32) (result i32))`
 
-Interpreted as `fn write_meta(alloc: u64) -> i32`.
+Interpreted as `fn write_meta(offset: u32, length: u32) -> i32`.
 
 Reads a response meta blob from an allocation. Returns an I/O result.
 
@@ -291,18 +285,18 @@ The headers bear the same restrictions as described above.
 This function can be used repeatedly: only the last write will be used when the
 request is sent.
 
-##### `(func (import "env" "read_body") (param i64) (result i32))`
+##### `(func (import "env" "read_body") (param i32 i32) (result i32))`
 
-Interpreted as `fn read_body(alloc: u64) -> i32`.
+Interpreted as `fn read_body(offset: u32, length: u32) -> i32`.
 
 Reads as much as the request body is available, up to the allocation size.
 Returns an I/O result.
 
 The allocation should then be truncated to the length received from the result.
 
-##### `(func (import "env" "write_body") (param i64) (result i32))`
+##### `(func (import "env" "write_body") (param i32 i32) (result i32))`
 
-Interpreted as `fn write_body(alloc: u64) -> i32`.
+Interpreted as `fn write_body(offset: u32, length: u32) -> i32`.
 
 Writes the entire allocation to the response body stream. Returns an I/O result.
 
