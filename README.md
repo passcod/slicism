@@ -32,7 +32,7 @@ In rough order.
 - [ ] Access to the world for Wasm (at least reading the filesystem)
 - [ ] Error value mapping
 - [x] Logging control in config
-- [ ] Logging cleanup
+- [x] Logging cleanup
 - [ ] Investigate why memory isn't dropped completely after each request
 - [ ] Stats (in statsd/influx format, to some UDP/TCP/file as configured)
 

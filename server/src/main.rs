@@ -329,7 +329,12 @@ impl fmt::Debug for LoadedSlice {
 
 impl LoadedSlice {
     pub fn new(source: &[u8], hash: u64) -> Result<Self> {
+        log::debug!("{:x}: loading from source", hash);
+
+        log::trace!("{:x}: compiling", hash);
         let module = compile_wasm(source)?;
+        log::trace!("{:x}: done compiling", hash);
+
         let info = module.info();
 
         let start = Self::detect_start(&info, "slice_start")?;
@@ -341,7 +346,7 @@ impl LoadedSlice {
             .and_then(|name| MetaFormat::new(&String::from_utf8_lossy(name)).ok())
             .unwrap_or_default();
 
-        Ok(Self {
+        let slice = Self {
             source_hash: hash,
             module,
             created: SystemTime::now(),
@@ -349,7 +354,10 @@ impl LoadedSlice {
             decay: Arc::new(AtomicBool::new(false)),
             start,
             meta_format,
-        })
+        };
+
+        log::debug!("{:x}: sliced: {:?}", hash, slice);
+        Ok(slice)
     }
 
     fn detect_start<'name>(info: &ModuleInfo, name: &'name str) -> Result<&'name str> {
@@ -379,6 +387,9 @@ impl LoadedSlice {
     }
 
     pub fn bite<S: Send + Sync + 'static>(&self, req: Request<S>) -> Result<Response> {
+        let hash = self.source_hash;
+        log::debug!("{}: start biting with {:x}", req.uri().path(), hash);
+
         let req_meta = self.meta_format.generate(&req)?;
         let req_meta_size = req_meta.len() as _;
 
@@ -391,7 +402,9 @@ impl LoadedSlice {
 
         let imports = imports! {
             "env" => {
-                "print_log" => func!(|ctx: &mut Ctx, level: u8, offset: u32, length: u32| {
+                "print_log" => func!(move |ctx: &mut Ctx, level: u8, offset: u32, length: u32| {
+                    log::trace!("{:x} called print_log", hash);
+
                     use log::Level::*;
                     const LOG_ERROR: u8 = Error as u8;
                     const LOG_WARN: u8 = Warn as u8;
@@ -415,13 +428,21 @@ impl LoadedSlice {
                     log::log!(level, "{}", message);
                 }),
 
-                "size_meta" => func!(move || -> u32 { req_meta_size }),
+                "size_meta" => func!(move || -> u32 {
+                    log::trace!("{:x} called size_meta", hash);
+
+                    req_meta_size
+                }),
 
                 "read_meta" => func!(move |ctx: &mut Ctx, offset: u32, length: u32| -> i32 {
+                    log::trace!("{:x} called read_meta", hash);
+
                     WasmAllocation::new(offset, length).write(ctx, &req_meta).map(|len| len as _).unwrap_or(-1)
                 }),
 
                 "read_body" => func!(move |ctx: &mut Ctx, offset: u32, length: u32| -> i32 {
+                    log::trace!("{:x} called read_body", hash);
+
                     let alloc = WasmAllocation::new(offset, length);
                     let mut buf = vec![0; alloc.length as _];
                     task::block_on(async {
@@ -433,6 +454,8 @@ impl LoadedSlice {
                 }),
 
                 "write_meta" => func!(move |ctx: &mut Ctx, offset: u32, length: u32| -> i32 {
+                    log::trace!("{:x} called write_meta", hash);
+
                     WasmAllocation::new(offset, length).read(ctx).and_then(|meta| {
                         let len = meta.len() as _;
                         meta_sen.store(meta);
@@ -440,13 +463,17 @@ impl LoadedSlice {
                     }).unwrap_or(-1)
                 }),
 
-                "send_meta" => func!(|| -> i32 {
+                "send_meta" => func!(move || -> i32 {
+                    log::trace!("{:x} called send_meta", hash);
+
                     // activate true response streaming!
                     // send the request early and hook up the body stream
                     -1
                 }),
 
                 "write_body" => func!(move |ctx: &mut Ctx, offset: u32, length: u32| -> i32 {
+                    log::trace!("{:x} called write_body", hash);
+
                     WasmAllocation::new(offset, length).read(ctx).and_then(|body| {
                         let len = body.len() as _;
                         body_sen.unbounded_send(body)?;
@@ -457,15 +484,28 @@ impl LoadedSlice {
         };
 
         self.decay.swap(false, Ordering::AcqRel);
-        self.counter.fetch_add(1, Ordering::Relaxed);
-        self.module.instantiate(&imports)?.call(self.start, &[])?;
+        let prior = self.counter.fetch_add(1, Ordering::Relaxed);
+        log::debug!("{:x} unset decay, increment counter (was {})", hash, prior);
 
+        {
+            log::debug!("{:x} instantiate", hash);
+            let inst = self.module.instantiate(&imports)?;
+            log::debug!("{:x} call start", hash);
+            inst.call(self.start, &[])?;
+            log::debug!("{:x} drop instance", hash);
+        }
+
+        log::trace!("{:x} close body stream", hash);
         body_rec.close();
 
-        Ok(self
-            .meta_format
-            .parse(&meta_rec.take())?
-            .body(body_rec.map(|chunk| Ok(chunk)).into_async_read()))
+        log::trace!("{:x} parse meta", hash);
+        let res = self.meta_format.parse(&meta_rec.take())?;
+
+        log::trace!("{:x} hook up body", hash);
+        let res = res.body(body_rec.map(|chunk| Ok(chunk)).into_async_read());
+
+        log::debug!("{:x} swallow", hash);
+        Ok(res)
     }
 }
 
@@ -861,10 +901,16 @@ fn main() -> Result<()> {
         let state = State::new(slicefile);
 
         let mut app = tide::with_state(state.clone());
+
+        log::trace!("registering / route");
         app.at("/").all(handle);
+        log::trace!("registering * route");
         app.at("*").all(handle);
+
+        log::debug!("binding to {}", state.config.bind);
         let server = app.listen(state.config.bind);
 
+        log::debug!("spawning gc interval={:?}", state.config.gc.interval);
         let gc_loop = task::spawn(async move {
             loop {
                 task::sleep(state.config.gc.interval).await;
@@ -872,7 +918,9 @@ fn main() -> Result<()> {
             }
         });
 
+        log::debug!("start");
         server.await?;
+        log::trace!("gc loop await");
         gc_loop.await;
         Ok(())
     })
