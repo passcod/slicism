@@ -185,6 +185,7 @@ impl MetaFormat {
         #[derive(Deserialize)]
         struct Meta {
             pub status: u16,
+            #[serde(default)]
             pub headers: Vec<(Vec<u8>, Vec<u8>)>,
         }
 
