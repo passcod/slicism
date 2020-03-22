@@ -186,13 +186,13 @@ The import namespace is `env` (the de-facto default for wasm modules).
 Interpreted as: `fn print_log(level: u8, offset: u32, length: u32)`.
 
 Prints a log message to the server log. The level corresponds to the Rust
-log::Level enum values. Currently:
+log::Level enum values. [Currently](https://play.rust-lang.org/?version=stable&mode=debug&edition=2018&gist=7ced16541511da7196108a7f37961196):
 
-- Trace: 1
-- Debug: 2
+- Trace: 5
+- Debug: 4
 - Info: 3 (default if another value is given)
-- Warn: 4
-- Error: 5
+- Warn: 2
+- Error: 1
 
 The message is read as a UTF-8 string (lossy conversion) from the allocation
 given. Errors are silently ignored.
