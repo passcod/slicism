@@ -18,7 +18,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use tide::{Request, Response};
 use wasmer_runtime::{compile as compile_wasm, func, imports, Ctx, Module};
@@ -758,16 +758,35 @@ impl State {
 
 async fn handle(req: Request<Arc<State>>) -> Response {
     let display_errors = req.state().config.display_errors;
+
+    let version = req.version().clone();
+    let method = req.method().clone();
     let uri = req.uri().clone();
 
-    slicing(req).await.unwrap_or_else(|err| {
+    let start = Instant::now();
+    let res = slicing(req).await.unwrap_or_else(|err| {
         log::error!("While processing {}, got error: {}", uri, err);
         let mut res = Response::new(500);
         if display_errors {
             res = res.body_string(format!("Slicism error: {}", err));
         }
         res
-    })
+    });
+
+    log::info!(
+        "{version:?} - {status:} [{time:}] - {method:} {uri:}",
+        version = version,
+        status = res.status().as_u16(),
+        time = humantime::format_duration(start.elapsed())
+            .to_string()
+            .split(" ")
+            .next()
+            .unwrap_or("0ns"),
+        method = method,
+        uri = uri
+    );
+
+    res
 }
 
 macro_rules! prelog {
