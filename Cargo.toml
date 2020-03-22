@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "server",
+    "edit",
     "slices/echo",
 ]
 
