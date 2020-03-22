@@ -28,7 +28,7 @@ In rough order.
 
 - [ ] Mappings (URL rewriting)
 - [ ] Preloading (walking the root and loading every wasm found at start time)
-- [ ] Static files (for dev ease, production should use nginx)
+- [x] Static files (for dev ease, production should use nginx)
 - [ ] Access to the world for Wasm (at least reading the filesystem)
 - [ ] Error value mapping
 - [ ] Logging control in config
@@ -117,7 +117,6 @@ display_errors = true
 # Slicism should be behind a reverse proxy that handles files properly, with
 # all the support for streaming, resuming, caching, etc. In development, it's
 # often useful to have slicism do that for you. The default is off.
-# (not yet implemented)
 #
 static_files = true
 
