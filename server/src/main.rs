@@ -310,7 +310,7 @@ pub struct LoadedSlice {
 impl fmt::Debug for LoadedSlice {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("LoadedSlice")
-            .field("source_hash", &self.source_hash)
+            .field("source_hash", &format!("{:x}", self.source_hash))
             .field("created", &self.created)
             .field("counter", &self.counter)
             .field("decay", &self.decay)
@@ -491,6 +491,7 @@ impl Slices {
         let modtime = meta.modified().or_else(|_| meta.created())?;
         log::trace!("{}: timestamp is {:?}", path.display(), modtime);
 
+        let mut clear_path_entry = false;
         if let Some(r) = self.from_path.get(&path) {
             let hash = r.value();
             log::trace!("{}: from_path cache hit: {:x}", path.display(), hash);
@@ -513,11 +514,16 @@ impl Slices {
             } else {
                 log::trace!("{}: from_hash cache miss: from_path stale", path.display());
                 // the from_path entry is stale
-                self.from_path.remove(&path);
+                clear_path_entry = true;
             }
         } else {
             log::trace!("{}: from_path cache miss", path.display());
             // new entry
+        }
+
+        // avoids hanging to do this outside the get()
+        if clear_path_entry {
+            self.from_path.remove(&path);
         }
 
         log::trace!("{}: reading file", path.display());
@@ -689,20 +695,35 @@ impl State {
     }
 
     async fn gc(&self) {
+        log::debug!("starting gc run");
+
         let mut unload_list = Vec::new();
         let mut invalids = BTreeMap::new();
         for r in self.slices.from_hash.iter() {
             match r.value() {
                 Slice::Loaded(slice) => {
+                    log::trace!("looking at loaded slice {:?}", slice);
                     let decayed = slice.decay.swap(true, Ordering::AcqRel);
                     if decayed {
+                        log::trace!("{:x} has decayed, mark for sweep", slice.source_hash);
                         unload_list.push(*r.key());
                     }
                 }
                 Slice::InvalidWasm { seen } => {
+                    log::trace!("looking at invalid tombstone last seen {:?}", seen);
                     invalids.insert(seen.clone(), *r.key());
                 }
             }
+        }
+
+        let unloads = unload_list.len();
+
+        if invalids.len() > 0 {
+            log::trace!(
+                "got {} tombstones, limit is {}",
+                invalids.len(),
+                self.config.gc.keep_invalids
+            );
         }
 
         if invalids.len() > self.config.gc.keep_invalids {
@@ -711,9 +732,20 @@ impl State {
             }
         }
 
+        let invals = unload_list.len() - unloads;
+
         for hash in unload_list.into_iter() {
+            log::trace!("sweep {:x}", hash);
             // todo: take out of from_path
             self.slices.from_hash.remove(&hash);
+        }
+
+        if unloads > 0 || invals > 0 {
+            log::info!(
+                "gc ran: {} slices unloaded, {} invalid tombstones cleared",
+                unloads,
+                invals
+            );
         }
     }
 }
