@@ -318,3 +318,20 @@ Before it's called, the request meta blob will be prepared, such that the
 
 After it's called, the response meta blob will be parsed, the response body
 buffer prepared, and the HTTP server will stream the response back along.
+
+### Examples
+
+- The smallest possible program, hand-written in Wasm Text format:
+  [slices/no-content.wat](./slices/no-content.wat). Compile with:
+
+  ```bash
+  $ wat2wasm -vo slices/no-content.wasm slices/no-content.wat
+  ```
+
+- A larger program in Rust, showing off the support library (soon):
+  [slices/echo/](./slices/echo/src/lib.rs). Compile with:
+
+  ```bash
+  $ cargo build -p slicism-slice-echo --target wasm32-unknown-unknown --release
+  $ cp target/wasm32-unknown-unknown/release/slicism_slice_echo.wasm slices/echo.wasm
+  ```
