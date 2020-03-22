@@ -705,6 +705,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd179ae861f0c2e53da70d892f5f3029f9594be0c41dc5269cd371691b1dc2f9"
 
 [[package]]
+name = "humantime"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9b6c53306532d3c8e8087b44e6580e10db51a023cf9b433cea2ac38066b92da"
+
+[[package]]
+name = "humantime-serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1c57351e2c81b7a03e82a6c8f4198b309c158f6d67c4adb707af6af7d91465a"
+dependencies = [
+ "humantime",
+ "serde",
+]
+
+[[package]]
 name = "hyper"
 version = "0.12.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1220,6 +1236,9 @@ name = "serde"
 version = "1.0.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e707fbbf255b8fc8c3b99abb91e7257a622caeb20a9818cbadbeeede4e0932ff"
+dependencies = [
+ "serde_derive",
+]
 
 [[package]]
 name = "serde-bench"
@@ -1312,6 +1331,7 @@ dependencies = [
  "fern",
  "futures 0.3.4",
  "http-service",
+ "humantime-serde",
  "indexmap",
  "log",
  "num-derive",

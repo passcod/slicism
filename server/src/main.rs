@@ -2,7 +2,7 @@ use async_std::{fs, io::BufReader, prelude::*, task};
 use crossbeam::atomic::AtomicCell;
 use dashmap::DashMap;
 use error_chain::{bail, error_chain};
-use futures::channel::mpsc::unbounded;
+use futures::{channel::mpsc::unbounded, stream::TryStreamExt};
 use indexmap::IndexMap;
 use num_derive::{FromPrimitive, ToPrimitive};
 use regex::Regex;
@@ -18,7 +18,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 use tide::{Request, Response};
 use wasmer_runtime::{
@@ -28,10 +28,6 @@ use wasmer_runtime_core::module::{ExportIndex, ModuleInfo};
 
 #[cfg(not(any(target_pointer_width = "32", target_pointer_width = "64")))]
 compile_error!("only 32 and 64 bit pointers are supported");
-
-const fn default_version() -> usize {
-    1
-}
 
 fn default_bind() -> SocketAddr {
     "127.0.0.1:8080".parse().unwrap()
@@ -43,8 +39,6 @@ fn default_path() -> PathBuf {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Slicefile {
-    #[serde(default = "default_version")]
-    pub version: usize,
     #[serde(default = "default_bind")]
     pub bind: SocketAddr,
     #[serde(default = "default_path")]
@@ -70,15 +64,15 @@ impl Slicefile {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct GcOpts {
-    #[serde(default = "GcOpts::default_interval")]
-    pub interval: usize,
+    #[serde(with = "humantime_serde", default = "GcOpts::default_interval")]
+    pub interval: Duration,
     #[serde(default = "GcOpts::default_invalids")]
     pub keep_invalids: usize,
 }
 
 impl GcOpts {
-    const fn default_interval() -> usize {
-        300
+    const fn default_interval() -> Duration {
+        Duration::from_secs(5 * 60)
     }
     const fn default_invalids() -> usize {
         100
@@ -402,14 +396,16 @@ impl LoadedSlice {
         self.counter.load(Ordering::Relaxed)
     }
 
-    pub fn bite<S: Send + Sync>(&self, req: &Request<S>) -> Result<Response> {
-        let req_meta = self.meta_format.generate(req)?;
+    pub fn bite<S: Send + Sync + 'static>(&self, req: Request<S>) -> Result<Response> {
+        let req_meta = self.meta_format.generate(&req)?;
         let req_meta_size = req_meta.len() as _;
 
-        let (body_sen, body_rec) = unbounded();
+        let (body_sen, mut body_rec) = unbounded();
 
         let meta_sen = Arc::new(AtomicCell::default());
         let meta_rec = meta_sen.clone();
+
+        let body_lock = futures::lock::Mutex::new(req);
 
         let imports = imports! {
             "env" => {
@@ -444,9 +440,14 @@ impl LoadedSlice {
                 }),
 
                 "read_body" => func!(move |ctx: &mut Ctx, alloc: u64| -> i32 {
-                    let body_available = b"todo";
                     let alloc = WasmAllocation::from(alloc);
-                    alloc.write(ctx, &body_available[0..(alloc.length as _)]).map(|len| len as _).unwrap_or(-1)
+                    let mut buf = vec![0; alloc.length as _];
+                    task::block_on(async {
+                        let mut req = body_lock.lock().await;
+                        req.read(&mut buf).await
+                    }).map_err(Into::into).and_then(|len| {
+                        alloc.write(ctx, &buf[0..len])
+                    }).map(|len| len as _).unwrap_or(-1)
                 }),
 
                 "write_meta" => func!(move |ctx: &mut Ctx, alloc: u64| -> i32 {
@@ -456,6 +457,12 @@ impl LoadedSlice {
                         meta_sen.store(meta);
                         Ok(len)
                     }).unwrap_or(-1)
+                }),
+
+                "send_meta" => func!(|| -> i32 {
+                    // activate true response streaming!
+                    // send the request early and hook up the body stream
+                    -1
                 }),
 
                 "write_body" => func!(move |ctx: &mut Ctx, alloc: u64| -> i32 {
@@ -469,16 +476,16 @@ impl LoadedSlice {
             },
         };
 
+        self.decay.swap(false, Ordering::AcqRel);
         self.counter.fetch_add(1, Ordering::Relaxed);
-
         self.module.instantiate(&imports)?.call(self.start, &[])?;
 
-        let res = self.meta_format.parse(&meta_rec.take())?;
+        body_rec.close();
 
-        // let cursor = futures::io::Cursor::new(res.body);
-        // res.body(cursor)
-
-        Ok(res)
+        Ok(self
+            .meta_format
+            .parse(&meta_rec.take())?
+            .body(body_rec.map(|chunk| Ok(chunk)).into_async_read()))
     }
 }
 
@@ -661,7 +668,7 @@ async fn slicing(req: Request<Arc<State>>) -> Result<Response> {
         state.slices.load(path.clone(), file).await?;
         match state.slices.get_loaded(path) {
             Some(Slice::Loaded(slice)) => {
-                let res = slice.bite(&req)?;
+                let res = slice.bite(req)?;
                 dbg!(&slice.counter);
                 Ok(res)
             }
@@ -688,7 +695,6 @@ impl State {
         })
     }
 
-    // run every <config.gc.interval> default 1h
     async fn gc(&self) {
         let mut unload_list = Vec::new();
         let mut invalids = BTreeMap::new();
@@ -758,7 +764,17 @@ fn main() -> Result<()> {
         let mut app = tide::with_state(state.clone());
         app.at("/").all(handle);
         app.at("*").all(handle);
-        app.listen(&state.config.bind).await?;
+        let server = app.listen(state.config.bind);
+
+        let gc_loop = task::spawn(async move {
+            loop {
+                task::sleep(state.config.gc.interval).await;
+                state.gc().await;
+            }
+        });
+
+        server.await?;
+        gc_loop.await;
         Ok(())
     })
 }
