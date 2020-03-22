@@ -33,6 +33,7 @@ In rough order.
 - [ ] Error value mapping
 - [ ] Logging control in config
 - [ ] Logging cleanup
+- [ ] Investigate why memory isn't dropped completely after each request
 - [ ] Stats (in statsd/influx format, to some UDP/TCP/file as configured)
 
 ## So what's the point then?

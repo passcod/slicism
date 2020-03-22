@@ -755,12 +755,12 @@ async fn handle(req: Request<Arc<State>>) -> Response {
     let uri = req.uri().clone();
 
     slicing(req).await.unwrap_or_else(|err| {
+        log::error!("While processing {}, got error: {}", uri, err);
+        let mut res = Response::new(500);
         if display_errors {
-            Response::new(500).body_string(format!("Slicism error: {}", err))
-        } else {
-            log::error!("While processing {}, got error: {}", uri, err);
-            Response::new(500)
+            res = res.body_string(format!("Slicism error: {}", err));
         }
+        res
     })
 }
 
