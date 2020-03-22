@@ -162,7 +162,7 @@ described are what Slicism supports directly, and are expressed in Wasm text
 format.
 
 There is a support library crate `slicism-rust-support` to make the Rust
-experience ergonomic, but it is not required.
+experience ergonomic, but it is not required. (to be implemented)
 
 #### Types
 

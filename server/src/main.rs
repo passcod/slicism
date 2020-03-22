@@ -587,9 +587,7 @@ impl Slices {
 
 error_chain! {
     foreign_links {
-        IntConversion(::std::num::TryFromIntError);
         Io(::std::io::Error);
-        Layout(::std::alloc::LayoutErr);
         Log(::log::SetLoggerError);
 
         Cbor(::serde_cbor::error::Error);
@@ -603,35 +601,17 @@ error_chain! {
 
         WasmCompilation(::wasmer_runtime_core::error::CompileError);
         WasmInstantiation(::wasmer_runtime::error::Error);
-        WasmResolve(::wasmer_runtime_core::error::ResolveError);
-        WasmCallOld(::wasmer_runtime_core::error::CallError);
-        WasmCall(::wasmer_runtime_core::error::RuntimeError);
+        WasmCall(::wasmer_runtime_core::error::CallError);
     }
 
     errors {
-        Unreachable {}
-
         WasmInvalid {
             description("file is invalid wasm")
-        }
-
-        WasmNullPtr {
-            description("wasm returned a null pointer")
-        }
-
-        WasmTypeMismatch(expected: &'static str) {
-            description("unexpected type returned from wasm")
-            display("unexpected type returned from wasm, expected {}", expected)
         }
 
         WasmStartMissing {
             description("wasm start missing")
             display("missing wasm start export: needs either of slice_start, wasi_start, main")
-        }
-
-        WasmError(e: WasmError) {
-            description("wasm internal error")
-            display("wasm internal error: {:?} ({})", e, e.code())
         }
 
         WasmAllocTooSmall(alloc: u32, wanted: u32) {
@@ -660,6 +640,7 @@ async fn slicing(req: Request<Arc<State>>) -> Result<Response> {
         .config
         .root
         .join(path.to_string().trim_start_matches('/'));
+    // todo: check that we're still in root (security)
     let file = fs::File::open(&path).await?;
     //^ todo: 404 if file does not exist, 401 for wrong permission, 500 for i/o
 
